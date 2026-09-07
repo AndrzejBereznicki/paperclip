@@ -24,8 +24,8 @@ describe("GitHub grant metadata", () => {
       }
       if (url.pathname === "/user/installations/101/repositories") {
         return json({ total_count: 2, repositories: secondPage
-          ? [{ id: 2, full_name: "paperclipai/b", description: "must-not-persist", clone_url: "must-not-persist" }]
-          : [{ id: 1, full_name: "paperclipai/a" }],
+          ? [{ id: 2, full_name: "paperclipai/b", private: true, description: "must-not-persist", clone_url: "must-not-persist" }]
+          : [{ id: 1, full_name: "paperclipai/a", private: false }],
         }, !secondPage);
       }
       if (url.pathname === "/user/installations/102/repositories") {
@@ -45,20 +45,32 @@ describe("GitHub grant metadata", () => {
       installationOwnerLogins: ["paperclipai", "octocat"],
       repositories: [
         { id: "3", fullName: "octocat/c", installationId: "102" },
-        { id: "1", fullName: "paperclipai/a", installationId: "101" },
-        { id: "2", fullName: "paperclipai/b", installationId: "101" },
+        { id: "1", fullName: "paperclipai/a", installationId: "101", private: false },
+        { id: "2", fullName: "paperclipai/b", installationId: "101", private: true },
       ],
       installationUrl: "https://github.com/apps/paperclip-development/installations/new",
       managementUrl: "https://github.com/settings/installations/101",
       appSlug: "paperclip-development",
       webhookHealth: "pending",
     });
+    expect(metadata.repositories[0]).not.toHaveProperty("private");
     expect(JSON.stringify(metadata)).not.toContain("must-not-persist");
     expect(request).toHaveBeenCalledTimes(6);
     for (const [input, init] of request.mock.calls) {
       expect(new URL(String(input)).origin).toBe("https://api.github.com");
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer ghu_secret");
     }
+  });
+
+  it("recovers a legacy grant's app chooser from GitHub installation metadata", async () => {
+    const request = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(json({ id: 42, login: "octocat" }))
+      .mockResolvedValueOnce(json({ installations: [{ id: 101, app_slug: "paperclip-staging", repository_selection: "selected" }] }))
+      .mockResolvedValueOnce(json({ repositories: [{ id: 1, full_name: "octocat/a" }] }));
+    await expect(loadGitHubGrantMetadata("ghu_secret", request)).resolves.toMatchObject({
+      appSlug: "paperclip-staging",
+      installationUrl: "https://github.com/apps/paperclip-staging/installations/new",
+    });
   });
 
   it("requires at least one installation with an accessible repository", async () => {
