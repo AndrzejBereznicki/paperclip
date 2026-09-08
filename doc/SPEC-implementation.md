@@ -1039,6 +1039,17 @@ instances return `404`.
 - `GET /issues/:issueId/attachments`
 - `GET /attachments/:attachmentId/content`
 - `DELETE /attachments/:attachmentId`
+- `GET /issues/:issueId/runner-goal?agentId=...`
+- `POST /issues/:issueId/runner-goal/actions`
+
+The runner-goal endpoints control an issue-scoped durable agent-session goal,
+not a row in the company `goals` hierarchy. Reads return the effective agent,
+negotiated capability, normalized goal snapshot, active-run state, pending
+action, and revision. Mutations require a request id, assigned agent, expected
+revision, and a negotiated action; they return `202`, replay the original result
+for a duplicate request id, and return `409` with the current projection for a
+stale revision or an unconfirmed unfinished-goal replacement. These controls do
+not create issue comments.
 
 ### 10.4.1 Atomic Checkout Contract
 
@@ -1232,6 +1243,35 @@ Scheduler must skip invocation when:
 - agent is paused/terminated
 - an existing run is active
 - hard budget limit has been hit
+
+## 11.7 Durable agent session goals
+
+Runner Protocol v2 negotiates a required `sessionGoals` capability and typed
+`session.goal.*` commands and events. PRP v1 sessions remain supported and are
+goal unsupported. The Codex app-server driver maps controls to
+`thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`; it observes
+provider-created goal notifications and reconciles with an authoritative get
+after each turn. An active goal suppresses premature run terminalization while
+autonomous turns continue. The Paperclip runner's persistent ACP backend opts
+in through the `_session/goal` extension and advertises its exact action subset.
+Its pinned Codex/Claude executables retain the runner's Linux x64 qualification
+requirement. Direct `codex_local` and `claude_local` adapters currently have no
+live goal controller and remain unsupported, even when their underlying ACP
+package exposes goals. Goal actions never change an agent's adapter, model,
+permission policy, or rollout settings to manufacture support. CLI, one-shot
+ACP, and providers without the structured extension remain unsupported.
+
+When a goal heartbeat settles, the runner suspends its durable authority even
+under a warm lifecycle policy. Paused, blocked, completed, and rollover goals
+must survive controller restart without relying on an in-memory warm owner.
+The next run resumes the same provider session through the existing verified
+checkpoint and authority-rotation path.
+
+The board composer treats `/goal` as an action command rather than Markdown or
+comment text. It is capability-aware, and the issue thread renders durable goal
+status and controls immediately above the composer. Goal completion enters the
+normal run-result/completion arbitration path and does not directly close the
+issue.
 
 ## 12. Governance and Approval Flows
 

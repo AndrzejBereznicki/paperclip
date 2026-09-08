@@ -52,6 +52,7 @@ import {
   agents,
   agentConfigRevisions,
   agentRuntimeState,
+  agentSessionGoalActions,
   agentTaskSessions,
   agentWakeupRequests,
   activityLog,
@@ -162,6 +163,7 @@ import { recordFailedSkillPreparation, type NativeRunHistoricalSpan } from "./na
 import {
   parseNativeExecutionInput,
   type NativeExecutionInput,
+  type NativeSessionGoalControl,
   type NativeSessionBackend,
 } from "../vendor/paperclip-runner/index.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
@@ -261,6 +263,13 @@ import {
   WORKTREE_INSTANCE_ROOT_METADATA_KEY,
 } from "./workspace-instance-cleanup.js";
 import { issueService } from "./issues.js";
+import {
+  blockRunnerGoalRecovery,
+  failRunnerGoalAction,
+  isRunnerGoalActionCompleted,
+  runnerGoalService,
+  settleLiveRunnerGoalBeforeInterrupt,
+} from "./runner-goals.js";
 import { projectService } from "./projects.js";
 import {
   authorizationService,
@@ -4056,6 +4065,33 @@ export function buildReferencedProjectRunObservability(input: {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function parseNativeSessionGoalControl(
+  value: unknown,
+): NativeSessionGoalControl | null {
+  const candidate = parseObject(value);
+  const requestId = readNonEmptyString(candidate.requestId);
+  const action = readNonEmptyString(candidate.action);
+  if (
+    !requestId ||
+    !action ||
+    !["create", "edit", "replace", "pause", "resume", "clear"].includes(action)
+  ) return null;
+  const objective = readNonEmptyString(candidate.objective);
+  const tokenBudget = candidate.tokenBudget === null
+    ? null
+    : typeof candidate.tokenBudget === "number" &&
+        Number.isSafeInteger(candidate.tokenBudget) &&
+        candidate.tokenBudget > 0
+      ? candidate.tokenBudget
+      : undefined;
+  return {
+    requestId,
+    action: action as NativeSessionGoalControl["action"],
+    ...(objective ? { objective } : {}),
+    ...(tokenBudget !== undefined ? { tokenBudget } : {}),
+  };
 }
 
 function sanitizeAgentSessionMessageText(value: unknown): string | null {
@@ -11261,11 +11297,16 @@ export function heartbeatService(
   async function handleRunLivenessContinuation(
     run: typeof heartbeatRuns.$inferSelect,
   ) {
+    const context = parseObject(run.contextSnapshot);
+    if (
+      readNonEmptyString(context.goalControlRequestId) ||
+      context.resumeSessionGoalHeartbeat === true
+    )
+      return;
     const livenessState = run.livenessState as RunLivenessState | null;
     if (livenessState !== "plan_only" && livenessState !== "empty_response")
       return;
 
-    const context = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(context.issueId);
     if (!issueId) return;
 
@@ -11487,6 +11528,17 @@ export function heartbeatService(
     const issueId =
       readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
     if (!issueId) return;
+    if (
+      readNonEmptyString(context.goalControlRequestId) ||
+      context.resumeSessionGoalHeartbeat === true
+    ) {
+      const goalProjection = await runnerGoalService(db).projection(
+        run.companyId,
+        issueId,
+        run.agentId,
+      );
+      if (goalProjection?.goal?.status !== "complete") return;
+    }
 
     const issue = await db
       .select({
@@ -11784,6 +11836,7 @@ export function heartbeatService(
     run: typeof heartbeatRuns.$inferSelect,
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
+    if (readNonEmptyString(contextSnapshot.goalControlRequestId)) return;
     const issueId =
       readNonEmptyString(contextSnapshot.issueId) ??
       readNonEmptyString(contextSnapshot.taskId);
@@ -12328,6 +12381,16 @@ export function heartbeatService(
     presentationDecision?: RunPresentationDecision | null,
   ) {
     const contextSnapshot = parseObject(run.contextSnapshot);
+    if (readNonEmptyString(contextSnapshot.goalControlRequestId)) {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) {
       if (run.issueCommentStatus !== "not_applicable") {
@@ -16860,6 +16923,155 @@ export function heartbeatService(
     }
   }
 
+  async function recoverActiveSessionGoals() {
+    if ((await getSchedulingSuppression()).suppressed) {
+      return { scanned: 0, enqueued: 0 };
+    }
+    const sessions = await db
+      .select({
+        id: agentTaskSessions.id,
+        companyId: agentTaskSessions.companyId,
+        agentId: agentTaskSessions.agentId,
+        issueId: agentTaskSessions.taskKey,
+        revision: agentTaskSessions.goalRevision,
+      })
+      .from(agentTaskSessions)
+      .innerJoin(
+        issues,
+        and(
+          sql`${issues.id}::text = ${agentTaskSessions.taskKey}`,
+          eq(issues.companyId, agentTaskSessions.companyId),
+          eq(issues.assigneeAgentId, agentTaskSessions.agentId),
+        ),
+      )
+      .where(
+        and(
+          eq(agentTaskSessions.goalDesiredState, "active"),
+          eq(agentTaskSessions.goalStatus, "active"),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    let enqueued = 0;
+    for (const session of sessions) {
+      const run = await enqueueWakeup(session.agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "goal_control",
+        payload: { issueId: session.issueId, intent: "goal_recovery" },
+        idempotencyKey: `goal_recovery:${session.id}:${session.revision}`,
+        requestedByActorType: "system",
+        contextSnapshot: {
+          issueId: session.issueId,
+          taskKey: session.issueId,
+          resumeSessionGoalHeartbeat: true,
+          skipIssueComment: true,
+        },
+      });
+      if (run) enqueued += 1;
+    }
+    return { scanned: sessions.length, enqueued };
+  }
+
+  async function recoverPendingSessionGoalActions() {
+    if ((await getSchedulingSuppression()).suppressed) {
+      return { scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 };
+    }
+    const pending = await db
+      .select({
+        id: agentSessionGoalActions.id,
+        requestId: agentSessionGoalActions.requestId,
+        payload: agentSessionGoalActions.payloadJson,
+        companyId: agentTaskSessions.companyId,
+        agentId: agentTaskSessions.agentId,
+        adapterType: agentTaskSessions.adapterType,
+        issueId: agentTaskSessions.taskKey,
+      })
+      .from(agentSessionGoalActions)
+      .innerJoin(
+        agentTaskSessions,
+        eq(agentTaskSessions.id, agentSessionGoalActions.sessionId),
+      )
+      .innerJoin(
+        issues,
+        and(
+          sql`${issues.id}::text = ${agentTaskSessions.taskKey}`,
+          eq(issues.companyId, agentTaskSessions.companyId),
+          eq(issues.assigneeAgentId, agentTaskSessions.agentId),
+        ),
+      )
+      .where(
+        inArray(agentSessionGoalActions.status, ["pending", "delivering", "delivered"]),
+      )
+      .orderBy(asc(agentSessionGoalActions.createdAt));
+
+    let enqueued = 0;
+    let alreadyQueued = 0;
+    let invalid = 0;
+    for (const action of pending) {
+      const control = parseNativeSessionGoalControl(action.payload);
+      if (!control || control.requestId !== action.requestId) {
+        invalid += 1;
+        await failRunnerGoalAction(
+          db,
+          {
+            companyId: action.companyId,
+            issueId: action.issueId,
+            agentId: action.agentId,
+            adapterType: action.adapterType,
+          },
+          action.requestId,
+          "session_goal_control_payload_invalid",
+        ).catch(() => undefined);
+        continue;
+      }
+
+      const inFlight = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, action.companyId),
+            eq(heartbeatRuns.agentId, action.agentId),
+            inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+          ),
+        )
+        .then((runs) => runs.some((run) =>
+          readNonEmptyString(parseObject(run.contextSnapshot).goalControlRequestId) ===
+            action.requestId
+        ));
+      if (inFlight) {
+        alreadyQueued += 1;
+        continue;
+      }
+
+      const run = await enqueueWakeup(action.agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "goal_control",
+        payload: {
+          issueId: action.issueId,
+          requestId: action.requestId,
+          intent: "goal_control_recovery",
+        },
+        idempotencyKey: `goal_control_recovery:${action.id}`,
+        requestedByActorType: "system",
+        contextSnapshot: {
+          issueId: action.issueId,
+          taskKey: action.issueId,
+          // Goal controls reconcile the provider session itself and remain
+          // valid after issue terminalization (for example, clearing a
+          // completed goal from its retained widget).
+          resumeIntent: true,
+          goalControlRequestId: action.requestId,
+          runnerGoalControl: control,
+          skipIssueComment: true,
+        },
+      });
+      if (run) enqueued += 1;
+    }
+    return { scanned: pending.length, enqueued, alreadyQueued, invalid };
+  }
+
   async function reconcileStrandedAssignedIssues() {
     return recovery.reconcileStrandedAssignedIssues({
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
@@ -19399,6 +19611,10 @@ export function heartbeatService(
       };
 
       let handle: RunLogHandle | null = null;
+      const goalCheckpointSession: { current: {
+        params: Record<string, unknown>;
+        displayId: string;
+      } | null } = { current: null };
       let stdoutExcerpt = "";
       let stderrExcerpt = "";
       let outputSeq = Number(run.lastOutputSeq ?? 0);
@@ -19720,6 +19936,23 @@ export function heartbeatService(
         };
 
         const adapter = getServerAdapter(agent.adapterType);
+        const durableGoalControlRun =
+          readNonEmptyString(context.goalControlRequestId) !== null ||
+          context.resumeSessionGoalHeartbeat === true;
+        // Goals must use the selected durable runner, never silently convert a
+        // direct adapter or let an old goal-control wake become a normal prompt.
+        if (durableGoalControlRun && agent.adapterType !== "paperclip_runner") {
+          const requestId = readNonEmptyString(context.goalControlRequestId);
+          if (issueRef && requestId) {
+            await failRunnerGoalAction(db, {
+              companyId: run.companyId,
+              issueId: issueRef.id,
+              agentId: agent.id,
+              adapterType: agent.adapterType,
+            }, requestId, "direct_adapter_goal_controller_unavailable");
+          }
+          throw new Error("direct_adapter_goal_controller_unavailable");
+        }
         // Runtime selection is immutable once persisted. In particular, turning the instance flag
         // off prevents new native runs without changing the recovery path for an already-native run.
         const nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({
@@ -19894,8 +20127,7 @@ export function heartbeatService(
             executionTarget.transport === "sandbox"
               ? (executionTarget.runnerLifecyclePolicy ?? null)
               : null;
-          const effectiveLifecyclePolicy =
-            environmentLifecyclePolicy ?? agentLifecyclePolicy;
+          const effectiveLifecyclePolicy = environmentLifecyclePolicy ?? agentLifecyclePolicy;
           if (
             effectiveLifecyclePolicy.mode === "warm" &&
             executionTarget?.kind === "remote" &&
@@ -20551,6 +20783,9 @@ export function heartbeatService(
         };
 
         let adapterResult: AdapterExecutionResult;
+        const runGoalControlRequestId = readNonEmptyString(
+          context.goalControlRequestId,
+        );
         try {
           if (nativeRuntimeResolution.kind === "native") {
             if (!nativeExecution || !nativeRunnerInstanceId)
@@ -20589,6 +20824,20 @@ export function heartbeatService(
               }
             }
             const nativeMcpServer = nativeMcpServers[0] ?? null;
+            let sessionGoalControl = parseNativeSessionGoalControl(
+              context.runnerGoalControl,
+            );
+            if (runGoalControlRequestId && !sessionGoalControl) {
+              throw new Error("session_goal_control_payload_invalid");
+            }
+            // A hard restart replays the heartbeat context, not a new user
+            // action. Do not repeat a completed create/replace/edit (which
+            // could reactivate or clear a goal that finished while detached).
+            const completedGoalControl = sessionGoalControl !== null && taskKey !== null
+              && await isRunnerGoalActionCompleted(db, {
+                companyId: agent.companyId, agentId: agent.id, issueId: taskKey,
+              }, sessionGoalControl.requestId);
+            if (completedGoalControl) sessionGoalControl = null;
             const nativeDispatchAtMs = Date.now();
             const runCreatedAtMs = run.createdAt.getTime();
             const runStartedAtMs = (run.startedAt ?? run.createdAt).getTime();
@@ -20671,6 +20920,30 @@ export function heartbeatService(
                       backend:
                         options.nativeSessionBackendFactory?.(nativeExecution),
                       useRunnerd: agent.adapterType === "paperclip_runner",
+                      adapterType: agent.adapterType,
+                      sessionGoalControl,
+                      resumeSessionGoalHeartbeat:
+                        context.resumeSessionGoalHeartbeat === true || completedGoalControl,
+                      onGoalCheckpoint: async (snapshot) => {
+                        if (!taskKey) return;
+                        const params = attachPaperclipSessionMetadataToSessionParams({
+                          ...runtimeSessionParamsForAdapter,
+                          sessionId: snapshot.identity.sessionId,
+                          cwd: executionWorkspace.cwd,
+                        }, configuredModel, sessionConfigMetadata)!;
+                        const displayId = snapshot.providerSessionId ?? snapshot.sessionId;
+                        await upsertTaskSession({
+                          companyId: agent.companyId,
+                          agentId: agent.id,
+                          adapterType: agent.adapterType,
+                          taskKey,
+                          sessionParamsJson: params,
+                          sessionDisplayId: displayId,
+                          lastRunId: run.id,
+                          lastError: null,
+                        });
+                        goalCheckpointSession.current = { params, displayId };
+                      },
                       onLog,
                       onEvent: onAdapterEvent,
                       preparationSpans: nativeRunnerPreparationSpans,
@@ -20901,6 +21174,37 @@ export function heartbeatService(
             }
           }
         } catch (adapterErr) {
+          if (
+            issueRef &&
+            context.resumeSessionGoalHeartbeat === true &&
+            !runGoalControlRequestId
+          ) {
+            await blockRunnerGoalRecovery(
+              db,
+              {
+                companyId: run.companyId,
+                issueId: issueRef.id,
+                agentId: agent.id,
+                adapterType: agent.adapterType,
+              },
+              "provider_session_goal_recovery_failed",
+            ).catch(() => undefined);
+          }
+          if (issueRef && runGoalControlRequestId) {
+            await failRunnerGoalAction(
+              db,
+              {
+                companyId: run.companyId,
+                issueId: issueRef.id,
+                agentId: agent.id,
+                adapterType: agent.adapterType,
+              },
+              runGoalControlRequestId,
+              adapterErr instanceof Error
+                ? adapterErr.message
+                : "session_goal_control_failed",
+            ).catch(() => undefined);
+          }
           const nativeResumeScheduled =
             nativeRuntimeResolution.kind === "native"
               ? await db
@@ -21523,7 +21827,14 @@ export function heartbeatService(
             agent,
             resolvedPresentationDecision,
           );
-          await releaseIssueExecutionAndPromote(livenessRun);
+          await releaseIssueExecutionAndPromote(livenessRun, {
+            suppressImmediateRecovery:
+              readNonEmptyString(
+                parseObject(livenessRun.contextSnapshot).goalControlRequestId,
+              ) !== null ||
+              parseObject(livenessRun.contextSnapshot)
+                .resumeSessionGoalHeartbeat === true,
+          });
           await handleRunLivenessContinuation(livenessRun);
           await handleIssueReviewPathDisposition(livenessRun);
           await handleSuccessfulRunHandoff(
@@ -21536,6 +21847,38 @@ export function heartbeatService(
               : livenessRun,
             agent,
           );
+          if (
+            outcome === "succeeded" &&
+            issueId &&
+            parseObject(adapterResult.resultJson).goalRolloverRequired === true
+          ) {
+            const rolloverProjection = await runnerGoalService(db).projection(
+              livenessRun.companyId,
+              issueId,
+              agent.id,
+            );
+            if (rolloverProjection?.goal?.status === "active") {
+              await enqueueWakeup(agent.id, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "goal_control",
+                payload: {
+                  issueId,
+                  intent: "goal_rollover",
+                  predecessorRunId: livenessRun.id,
+                },
+                idempotencyKey: `goal_rollover:${livenessRun.id}`,
+                requestedByActorType: "system",
+                contextSnapshot: {
+                  issueId,
+                  taskKey: issueId,
+                  resumeSessionGoalHeartbeat: true,
+                  skipIssueComment: true,
+                  goalRolloverFromRunId: livenessRun.id,
+                },
+              });
+            }
+          }
 
           // Dependency wake re-check: if this run's issue was marked done mid-run,
           // the route-time `issue_blockers_resolved` wake may have been gated by
@@ -21875,19 +22218,19 @@ export function heartbeatService(
 
           if (
             taskKey &&
-            (previousSessionParams || previousSessionDisplayId || taskSession)
+            (goalCheckpointSession.current || previousSessionParams || previousSessionDisplayId || taskSession)
           ) {
             await upsertTaskSession({
               companyId: agent.companyId,
               agentId: agent.id,
               adapterType: agent.adapterType,
               taskKey,
-              sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
+              sessionParamsJson: goalCheckpointSession.current?.params ?? attachPaperclipSessionMetadataToSessionParams(
                 previousSessionParams,
                 configuredModel,
                 sessionConfigMetadata,
               ),
-              sessionDisplayId: previousSessionDisplayId,
+              sessionDisplayId: goalCheckpointSession.current?.displayId ?? previousSessionDisplayId,
               lastRunId: failedRun.id,
               lastError: message,
             });
@@ -22073,7 +22416,14 @@ export function heartbeatService(
               );
             });
           }
-          await releaseIssueExecutionAndPromote(livenessRun).catch(
+          await releaseIssueExecutionAndPromote(livenessRun, {
+            suppressImmediateRecovery:
+              readNonEmptyString(
+                parseObject(livenessRun.contextSnapshot).goalControlRequestId,
+              ) !== null ||
+              parseObject(livenessRun.contextSnapshot)
+                .resumeSessionGoalHeartbeat === true,
+          }).catch(
             (releaseError) => {
               logger.error(
                 { err: releaseError, runId },
@@ -25747,6 +26097,8 @@ export function heartbeatService(
     },
 
     reconcileStrandedAssignedIssues,
+    recoverPendingSessionGoalActions,
+    recoverActiveSessionGoals,
 
     terminalizeRunOnLeaseRelease,
 

@@ -1723,6 +1723,13 @@
       "when": 1788812507973,
       "tag": "0247_even_moon_knight",
       "breakpoints": true
+    },
+    {
+      "idx": 248,
+      "version": "7",
+      "when": 1788901245075,
+      "tag": "0248_small_manta",
+      "breakpoints": true
     }
   ]
 }
