@@ -17,6 +17,7 @@ import type {
   NativeSessionBackend,
 } from "./contracts/native-session-backend.js";
 import type { PersistedNativeSession } from "./contracts/native-session-backend.js";
+import type { HarnessThreadGoal } from "./contracts/harness-driver.js";
 import {
   NativeProviderTerminalFailure,
   NativeSessionCloseUnrecoverableError,
@@ -24,13 +25,16 @@ import {
   NativeSessionProtocolIntegrityError,
 } from "./contracts/native-session-backend.js";
 import {
+  validatePrpStructuredRunResult,
   type PrpEvent,
   type PrpStructuredRunResult,
   type PrpTerminalState,
 } from "./protocol/replay-contract.js";
-import type { HarnessThreadGoal } from "./contracts/harness-driver.js";
-import { validatePrpStructuredRunResult } from "./protocol/replay-contract.js";
 import { parsePaperclipQuestionSet } from "./contracts/question-set.js";
+import {
+  retainedRunnerdCleanupProofIsCurrent,
+  type RetainedRunnerdCleanupProof,
+} from "./live/runnerd-codex-transport.js";
 
 export const DEFAULT_NATIVE_RUNTIME_INPUT_LIVE_WINDOW_MS = 120_000;
 export const DEFAULT_NATIVE_SEMANTIC_RESULT_TERMINAL_GRACE_MS = 5_000;
@@ -80,6 +84,47 @@ interface QuarantinedSessionCleanup {
 }
 
 const quarantinedSessionCleanups = new Set<QuarantinedSessionCleanup>();
+const sessionOriginRunnerInstances = new WeakMap<NativeSession, string>();
+
+/** Retire only the exact owner whose separate authenticated cleanup completed.
+ * The rejected close promise remains rejected; this neither resets a session
+ * nor authorizes an execution. Other quarantined owners remain admission gates. */
+export function completeRetainedNativeSessionCleanup(
+  proof: RetainedRunnerdCleanupProof,
+): number {
+  if (!retainedRunnerdCleanupProofIsCurrent(proof))
+    throw new NativeSessionCleanupQuarantinedError();
+  const domain = JSON.stringify([
+    proof.binding.companyId,
+    proof.backend.kind,
+    proof.backend.name,
+  ]);
+  const matches = [...quarantinedSessionCleanups].filter((entry) => {
+    const identity = entry.session.identity();
+    return (
+      entry.domain === domain &&
+      Object.entries(proof.binding).every(
+        ([key, value]) => identity[key as keyof typeof identity] === value,
+      )
+    );
+  });
+  if (
+    matches.length > 1 ||
+    matches.some(
+      (entry) =>
+        sessionOriginRunnerInstances.get(entry.session) !==
+          proof.identity.runnerInstanceId ||
+        !entry.operatorRecoveryRequired ||
+        entry.attempt ||
+        entry.recovery ||
+        entry.timer,
+    )
+  ) {
+    throw new NativeSessionCleanupQuarantinedError();
+  }
+  for (const entry of matches) quarantinedSessionCleanups.delete(entry);
+  return matches.length;
+}
 
 export interface NativeSessionGoalControl {
   requestId: string;
@@ -1971,6 +2016,7 @@ export async function executeNativeSession(
     }
     throw error;
   }
+  sessionOriginRunnerInstances.set(session, options.runnerInstanceId);
   let sessionClosePromise: Promise<void> | null = null;
   let sessionQuarantined = false;
   const quarantineSession = (reason: string) => {
@@ -2091,12 +2137,17 @@ export async function executeNativeSession(
     const recoveredActiveTurnId = recovered
       ? (recoveredSnapshot.activeTurnId ?? null)
       : (persistedSession?.activeTurnId ?? null);
-    const adoptedDispositionTerminal = Boolean(
+    const adoptedProviderTerminal = Boolean(
       recovered &&
-      recoveredSnapshot.dispositionOnlyRecoveryConsumed &&
       !recoveredActiveTurnId &&
-      (recoveredSnapshot.terminalTurns?.length ?? 0) >
-        (persistedSession?.terminalTurns?.length ?? 0),
+      recoveredSnapshot.terminalTurns?.some(
+        (terminal) =>
+          !persistedSession?.terminalTurns?.some(
+            (persistedTerminal) => persistedTerminal.turnId === terminal.turnId,
+          ) &&
+          (terminal.turnId === persistedSession?.activeTurnId ||
+            recoveredSnapshot.dispositionOnlyRecoveryConsumed),
+      ),
     );
     if (continuityBreak) {
       await options.onContinuityBreak?.({
@@ -2112,7 +2163,7 @@ export async function executeNativeSession(
     // first, retaining the older checkpoint lets the next recovery adopt and
     // emit the same provider terminal again instead of reconstructing a closed
     // session with no event to finalize.
-    if (!adoptedDispositionTerminal) {
+    if (!adoptedProviderTerminal) {
       await persistCheckpoint(recoveredSnapshot);
     }
 
@@ -2240,7 +2291,7 @@ export async function executeNativeSession(
         const shouldStartFreshTurn =
           !recovered ||
           (!recoveredActiveTurnId &&
-            !adoptedDispositionTerminal &&
+            !adoptedProviderTerminal &&
             !checkpointedDispositionTerminal &&
             !dispositionRecoveryStillOwned);
         if (options.sessionGoalControl) {
@@ -2340,15 +2391,38 @@ export async function executeNativeSession(
                   turnId: terminalEvent.turnId ?? null,
                 };
           signal.throwIfAborted();
-          if (settledCompletion === null && terminalEvent.eventType === "turn.failed") {
+          if (
+            settledCompletion === null &&
+            terminalEvent.eventType === "turn.failed"
+          ) {
             await checkpoint(signal);
             const payload = terminalEvent.payload as Record<string, unknown>;
-            const failure = payload.error && typeof payload.error === "object" ? payload.error as Record<string, unknown> : payload;
-            const message = typeof failure.message === "string" ? failure.message.slice(0, 2_000) : "Provider turn failed";
+            const failure =
+              payload.error && typeof payload.error === "object"
+                ? (payload.error as Record<string, unknown>)
+                : payload;
+            const message =
+              typeof failure.message === "string"
+                ? failure.message.slice(0, 2_000)
+                : "Provider turn failed";
+            const recoverable =
+              failure.recoverable === true || payload.recoverable === true;
+            // Retain the older consumer's permanent-model classification while
+            // preserving structured provider metadata. A provider explicitly
+            // permitting retry must not become permanent merely from its text.
+            const modelRejected =
+              !recoverable &&
+              /issue with the selected model|model_not_found|invalid model|model[^\n]*(?:does not exist|not found|not supported)/i.test(
+                message,
+              );
             throw new NativeProviderTerminalFailure(
-              typeof failure.code === "string" ? failure.code : "provider_turn_failed",
-              failure.recoverable === true || payload.recoverable === true,
-              message,
+              typeof failure.code === "string"
+                ? failure.code
+                : "provider_turn_failed",
+              recoverable,
+              modelRejected
+                ? `native_provider_model_rejected: ${message}`
+                : message,
             );
           }
           if (settledCompletion === null && options.resolveMissingResult) {
