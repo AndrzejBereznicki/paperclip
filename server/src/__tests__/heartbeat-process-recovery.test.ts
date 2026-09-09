@@ -6347,6 +6347,174 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("leaves the onboarding first task idle until the user comments", async () => {
+    const { companyId, agentId, issueId } =
+      await seedAssignedTodoNoRunFixture();
+    await db
+      .update(issues)
+      .set({ originKind: "onboarding_first_task" })
+      .where(eq(issues.id, issueId));
+    // The server-seeded greeting is agent-authored; it must not count as the
+    // user having typed.
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      authorType: "agent",
+      body: "Welcome to Paperclip!",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.onboardingFirstTaskExempted).toBe(1);
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.issueIds).toEqual([]);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(0);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(0);
+  });
+
+  it("keeps the onboarding first task idle while the seeded opening card is unanswered", async () => {
+    const { companyId, agentId, issueId } =
+      await seedAssignedTodoNoRunFixture();
+    await db
+      .update(issues)
+      .set({ originKind: "onboarding_first_task" })
+      .where(eq(issues.id, issueId));
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: agentId,
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "first-task-opening",
+            prompt: "What would you like to do?",
+            selectionMode: "single",
+            options: [
+              { id: "interview", label: "Interview me" },
+              { id: "task", label: "I have a task in mind", freeText: true },
+            ],
+          },
+        ],
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // A pending wake-policy card is a durable wait path of its own, so the
+    // sweep skips the issue before it even reaches the onboarding exemption.
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).toEqual([]);
+    expect(result.skipped).toBe(1);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(0);
+  });
+
+  it("dispatches the onboarding first task once the user answered the opening card", async () => {
+    const { companyId, agentId, issueId } =
+      await seedAssignedTodoNoRunFixture();
+    await db
+      .update(issues)
+      .set({ originKind: "onboarding_first_task" })
+      .where(eq(issues.id, issueId));
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "answered",
+      continuationPolicy: "wake_assignee",
+      createdByAgentId: agentId,
+      resolvedByUserId: "local-board",
+      resolvedAt: new Date(),
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "first-task-opening",
+            prompt: "What would you like to do?",
+            selectionMode: "single",
+            options: [
+              { id: "interview", label: "Interview me" },
+              { id: "task", label: "I have a task in mind", freeText: true },
+            ],
+          },
+        ],
+      },
+      result: {
+        version: 1,
+        answers: [{ questionId: "first-task-opening", optionIds: ["interview"] }],
+      },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // The answered wake-policy card with no run after it is a lost
+    // continuation: the sweep re-queues the assignee rather than leaving the
+    // first task idle. The onboarding exemption must not swallow it.
+    expect(result.onboardingFirstTaskExempted).toBe(0);
+    expect(result.assignmentDispatched + result.continuationRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    if (runs[0]?.id) {
+      await waitForRunToSettle(heartbeat, runs[0].id);
+    }
+  });
+
+  it("dispatches the onboarding first task once a user comment exists", async () => {
+    const { companyId, agentId, issueId } =
+      await seedAssignedTodoNoRunFixture();
+    await db
+      .update(issues)
+      .set({ originKind: "onboarding_first_task" })
+      .where(eq(issues.id, issueId));
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      authorUserId: "local-board",
+      authorType: "user",
+      body: "Let's start with a landing page.",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.onboardingFirstTaskExempted).toBe(0);
+    expect(result.assignmentDispatched).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    if (runs[0]?.id) {
+      await waitForRunToSettle(heartbeat, runs[0].id);
+    }
+  });
+
   it("does not duplicate initial assigned todo dispatch when a queued wake already exists", async () => {
     const { companyId, agentId, issueId } =
       await seedAssignedTodoNoRunFixture();

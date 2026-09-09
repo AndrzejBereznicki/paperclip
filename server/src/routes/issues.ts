@@ -193,9 +193,13 @@ import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
 import {
-  buildOnboardingGreeting,
+  renderOnboardingGreeting,
   ONBOARDING_GREETING_AUTHORIZATION_REASON,
 } from "../services/onboarding-greeting.js";
+import {
+  buildOnboardingFirstTaskBrief,
+  buildOnboardingFirstTaskOpeningQuestion,
+} from "../services/onboarding-first-task-assets.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeStateKey,
@@ -9322,6 +9326,23 @@ export function issueRoutes(
     const runWorkspaceInheritanceSourceIssueId = hasExplicitIssueWorkspaceCreateSelection(rawCreateBody)
       ? null
       : await resolveRunIssueWorkspaceInheritanceSource(companyId, actor);
+    // When this is genuinely the onboarding first task, the server owns the task
+    // description: assemble it from brief.md plus the proposal file the
+    // enableFirstTaskPlanProposal toggle selects, read once here at creation
+    // time, and ignore any client-supplied description. Flipping the toggle
+    // later does not change an existing first task. Best-effort: a read failure
+    // must not fail issue creation.
+    let onboardingFirstTaskDescription: string | null = null;
+    if (isOnboardingFirstTask && !watchdogProductBugFollowUp) {
+      try {
+        const experimental = await instanceSettings.getExperimental();
+        onboardingFirstTaskDescription = await buildOnboardingFirstTaskBrief({
+          usePlanProposal: experimental.enableFirstTaskPlanProposal === true,
+        });
+      } catch (err) {
+        logger.warn({ err, companyId }, "failed to assemble onboarding first-task brief");
+      }
+    }
     const createBody = {
       ...rawCreateBody,
       parentId: effectiveParentId,
@@ -9330,7 +9351,12 @@ export function issueRoutes(
         ? { inheritExecutionWorkspaceFromIssueId: runWorkspaceInheritanceSourceIssueId }
         : {}),
       ...(isOnboardingFirstTask && !watchdogProductBugFollowUp
-        ? { originKind: ONBOARDING_FIRST_TASK_ORIGIN_KIND }
+        ? {
+          originKind: ONBOARDING_FIRST_TASK_ORIGIN_KIND,
+          ...(onboardingFirstTaskDescription !== null
+            ? { description: onboardingFirstTaskDescription }
+            : {}),
+        }
         : {}),
       ...(watchdogProductBugFollowUp
         ? {
@@ -9520,15 +9546,13 @@ export function issueRoutes(
     // best-effort: a greeting failure must not fail issue creation.
     if (isOnboardingFirstTask && issue.assigneeAgentId) {
       try {
-        const [company, goal, assigneeAgent] = await Promise.all([
+        const [company, assigneeAgent] = await Promise.all([
           companiesSvc.getById(companyId),
-          createBody.goalId ? goalsSvc.getById(createBody.goalId) : Promise.resolve(null),
           agentsSvc.getById(issue.assigneeAgentId),
         ]);
-        const greetingBody = buildOnboardingGreeting({
+        const greetingBody = await renderOnboardingGreeting({
           agentName: assigneeAgent?.name ?? null,
-          teamName: company?.name ?? null,
-          goals: goal?.description ?? goal?.title ?? null,
+          organizationName: company?.name ?? null,
         });
         await svc.addComment(
           issue.id,
@@ -9545,17 +9569,47 @@ export function issueRoutes(
           "failed to seed onboarding first-task greeting",
         );
       }
+
+      // Seed the opening question card right after the greeting so the first
+      // task is not open-ended: "Interview me and propose a plan and an agent
+      // team" or "I have a task in mind" (free text). Posted as the assignee,
+      // deterministic (no LLM), and best-effort like the greeting. Answering
+      // the card wakes the assignee through the normal question-response path;
+      // typing a message instead supersedes the card and wakes on the comment.
+      try {
+        await issueThreadInteractionService(db).create(
+          issue,
+          {
+            kind: "ask_user_questions",
+            idempotencyKey: `onboarding-first-task:${issue.id}:opening-question`,
+            continuationPolicy: "wake_assignee",
+            payload: await buildOnboardingFirstTaskOpeningQuestion(),
+          },
+          { agentId: issue.assigneeAgentId },
+        );
+      } catch (err) {
+        logger.warn(
+          { err, issueId: issue.id, companyId },
+          "failed to seed onboarding first-task opening question",
+        );
+      }
     }
 
-    void queueIssueAssignmentWakeup({
-      heartbeat,
-      issue,
-      reason: "issue_assigned",
-      mutation: "create",
-      contextSource: "issue.create",
-      requestedByActorType: actor.actorType,
-      requestedByActorId: actor.actorId,
-    });
+    // Do not auto-wake the onboarding first task. Nothing should run and no
+    // token should be spent until the user types: the greeting is posted above
+    // (deterministic, no LLM) and the user's first comment wakes the assignee
+    // through the normal comment path. Every other create path keeps its wake.
+    if (!isOnboardingFirstTask) {
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue,
+        reason: "issue_assigned",
+        mutation: "create",
+        contextSource: "issue.create",
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+      });
+    }
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
     res.status(201).json({
