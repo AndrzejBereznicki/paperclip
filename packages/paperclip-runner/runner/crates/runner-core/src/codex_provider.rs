@@ -771,6 +771,14 @@ impl CodexProvider {
         observe: &mut dyn FnMut(ProviderStartupObservation) -> Result<(), LocalRunnerError>,
     ) -> Result<Self, LocalRunnerError> {
         config.validate()?;
+        if config.provider == "codex" {
+            if let Some(home) = std::env::var_os("CODEX_HOME") {
+                crate::codex_startup_trust::trust_startup_root(
+                    Path::new(&home),
+                    Path::new(&config.cwd),
+                )?;
+            }
+        }
         if process_generation == 0 {
             return Err(LocalRunnerError::invalid(
                 "Codex process generation must be positive",
@@ -834,12 +842,13 @@ impl CodexProvider {
                     &environment_keys,
                 )
             } else {
-                SupervisedProcess::spawn_with_environment_keys(
+                SupervisedProcess::spawn_in_directory_with_environment_keys(
                     &config.command,
                     &config.args,
                     Duration::from_secs(2),
                     CODEX_APP_SERVER_MAX_FRAME_BYTES,
                     &environment_keys,
+                    Path::new(&config.cwd),
                 )
             }
         })();
@@ -961,6 +970,9 @@ impl CodexProvider {
             }
             let method = if let Some(thread_id) = resume_thread_id {
                 params_object.insert("threadId".to_owned(), json!(thread_id));
+                if config.provider == "codex" {
+                    params_object.insert("excludeTurns".to_owned(), json!(true));
+                }
                 "thread/resume"
             } else {
                 params_object.insert("experimentalRawEvents".to_owned(), json!(false));
@@ -1737,10 +1749,99 @@ impl CodexProvider {
         // It does prove the provider remained live after that terminal, so a
         // subsequent nonzero exit is a separate idle-session failure.
         self.completion_reconciliation_pending = false;
-        self.request(
+        if self.config.provider != "codex" {
+            return self.request(
+                "thread/read",
+                json!({"threadId": self.thread_id, "includeTurns": true}),
+            );
+        }
+        let mut snapshot = self.request(
             "thread/read",
-            json!({"threadId": self.thread_id, "includeTurns": true}),
-        )
+            json!({"threadId": self.thread_id, "includeTurns": false}),
+        )?;
+        if snapshot.pointer("/thread/id").and_then(Value::as_str) != Some(self.thread_id.as_str()) {
+            return Err(LocalRunnerError::invalid(
+                "Codex thread/read returned a different thread",
+            ));
+        }
+        // Only metadata is needed to establish live authority. Never hydrate
+        // message contents just to decide whether this thread has an active turn.
+        match snapshot
+            .pointer("/thread/status/type")
+            .and_then(Value::as_str)
+        {
+            Some("idle") => {
+                snapshot["thread"]["turns"] = json!([]);
+                return Ok(snapshot);
+            }
+            Some("active") => {}
+            _ => {
+                return Err(LocalRunnerError::invalid(
+                    "codex_history_incomplete: unavailable thread status",
+                ))
+            }
+        };
+        let mut cursor = Value::Null;
+        let mut cursors = BTreeSet::new();
+        let mut turns = BTreeMap::new();
+        for _ in 0..10_000 {
+            let page = self
+                .request(
+                    "thread/turns/list",
+                    json!({
+                        "threadId": self.thread_id, "cursor": cursor, "limit": 100,
+                        "sortDirection": "desc", "itemsView": "notLoaded",
+                    }),
+                )
+                .map_err(|error| {
+                    LocalRunnerError::invalid(format!(
+                "codex_history_read_failed: supported thread/turns/list is required: {error}"
+            ))
+                })?;
+            let data = page.get("data").and_then(Value::as_array).ok_or_else(|| {
+                LocalRunnerError::invalid("codex_history_incomplete: turn page omitted data")
+            })?;
+            for turn in data {
+                let id = bounded_provider_turn_id(turn.get("id").and_then(Value::as_str))?;
+                if !matches!(
+                    turn.get("status").and_then(Value::as_str),
+                    Some("inProgress" | "completed" | "failed" | "interrupted" | "cancelled")
+                ) {
+                    return Err(LocalRunnerError::invalid(
+                        "codex_history_incomplete: invalid turn status",
+                    ));
+                }
+                turns.insert(id, turn.clone());
+            }
+            let found_active = turns
+                .values()
+                .any(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"));
+            let next = page.get("nextCursor").cloned().unwrap_or(Value::Null);
+            if next.is_null() || found_active {
+                if !found_active {
+                    return Err(LocalRunnerError::invalid(
+                        "codex_history_incomplete: active thread has no active turn",
+                    ));
+                }
+                snapshot["thread"]["turns"] = Value::Array(turns.into_values().collect());
+                return Ok(snapshot);
+            }
+            let next_text = next
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    LocalRunnerError::invalid("codex_history_incomplete: invalid turn cursor")
+                })?;
+            if !cursors.insert(next_text.to_owned()) {
+                return Err(LocalRunnerError::invalid(
+                    "codex_history_incomplete: repeated turn cursor",
+                ));
+            }
+            cursor = next;
+        }
+        Err(LocalRunnerError::invalid(
+            "codex_history_incomplete: turn page limit exceeded",
+        ))
     }
 
     pub fn resolve_runtime_request(
@@ -2337,6 +2438,21 @@ impl CodexProvider {
                 self.notification_identity_diagnostics += 1;
                 if self.notification_identity_diagnostics > 32 {
                     return Ok(None);
+                }
+                // Resume replays the cumulative usage of the last settled turn.
+                // Keep its identity and baseline, but never bill its `last`
+                // measurement to the newly attached run.
+                if method == "thread/tokenUsage/updated"
+                    && notification_thread_id(&params) == Some(self.thread_id.as_str())
+                {
+                    return Ok(Some(CodexProviderEvent::Notification {
+                        method: "paperclip/resumeUsageSnapshot".to_owned(),
+                        params: json!({
+                            "threadId": self.thread_id,
+                            "turnId": notification_turn_id,
+                            "total": params.pointer("/tokenUsage/total"),
+                        }),
+                    }));
                 }
                 return Ok(Some(CodexProviderEvent::Notification {
                     method: "warning".to_owned(),
