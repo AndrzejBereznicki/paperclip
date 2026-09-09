@@ -28,6 +28,7 @@ import { dirname, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
+import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
 import {
   validatePrpEvent,
@@ -224,6 +225,10 @@ export interface DurablePrpControlPlaneOptions {
   }) => Promise<{ readonly result: unknown; readonly isError?: boolean }>;
   /** Persist the canonical event before the runner receives its cumulative ACK. */
   onCommittedEvent?: (event: PrpEvent) => Promise<void>;
+  /** Stop this exact owner after a proven, authenticated permanent integrity fault. */
+  onProtocolIntegrityError?: (
+    error: NativeSessionProtocolIntegrityError,
+  ) => void;
   connectionLeaseTtlMs?: number;
 }
 
@@ -974,6 +979,9 @@ export class DurablePrpControlPlane {
   #port: number | null = null;
   #onSemanticToolInput?: DurablePrpControlPlaneOptions["onSemanticToolInput"];
   #onCommittedEvent?: DurablePrpControlPlaneOptions["onCommittedEvent"];
+  #onProtocolIntegrityError?:
+    DurablePrpControlPlaneOptions["onProtocolIntegrityError"];
+  #protocolIntegrityError: NativeSessionProtocolIntegrityError | null = null;
   #connectionLeaseTtlMs: number;
 
   constructor(options: DurablePrpControlPlaneOptions) {
@@ -999,6 +1007,7 @@ export class DurablePrpControlPlane {
     this.#expectedRunnerDigest = options.expectedRunnerDigest;
     this.#onSemanticToolInput = options.onSemanticToolInput;
     this.#onCommittedEvent = options.onCommittedEvent;
+    this.#onProtocolIntegrityError = options.onProtocolIntegrityError;
     this.#connectionLeaseTtlMs = options.connectionLeaseTtlMs ?? 60_000;
   }
 
@@ -1075,6 +1084,8 @@ export class DurablePrpControlPlane {
     identity: DurableRecoveryIdentity,
     runAttachTemplate?: Record<string, unknown>,
   ): void {
+    if (this.#protocolIntegrityError !== null)
+      throw this.#protocolIntegrityError;
     if (
       !Object.values(identity).every(
         (value) => typeof value === "string" && stableIdPattern.test(value),
@@ -1858,10 +1869,42 @@ export class DurablePrpControlPlane {
     );
   }
 
+  #failProtocolIntegrity(
+    connection: AuthorityConnection,
+    error: NativeSessionProtocolIntegrityError,
+  ): void {
+    try {
+      if (this.#protocolIntegrityError === null) {
+        this.#protocolIntegrityError = error;
+        this.#onProtocolIntegrityError?.(error);
+      }
+    } finally {
+      connection.close();
+    }
+  }
+
   async #event(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
   ): Promise<void> {
+    if (this.#protocolIntegrityError !== null) {
+      connection.close();
+      return;
+    }
+    // Authentication binds the channel, but an authenticated sender can still
+    // submit an envelope for another run. Such frames must not poison this
+    // owner's session or turn an unrelated digest failure into its terminal fault.
+    if (
+      envelope.runnerInstanceId !== this.#identity.runnerInstanceId ||
+      envelope.environmentLeaseId !== this.#identity.environmentLeaseId ||
+      envelope.runId !== this.#identity.runId ||
+      envelope.normalizedSessionId !== this.#identity.normalizedSessionId ||
+      envelope.turnId !== this.#identity.turnId ||
+      envelope.itemId !== this.#identity.itemId
+    ) {
+      connection.close();
+      return;
+    }
     const validated = validatePrpEvent(envelope.payload);
     if (!validated.ok) {
       connection.close();
@@ -1901,8 +1944,6 @@ export class DurablePrpControlPlane {
         !Object.prototype.hasOwnProperty.call(semantic, "input") ||
         typeof semantic.content !== "object" ||
         semantic.content === null ||
-        (semantic.content as Record<string, unknown>).digest !==
-          digestPaperclipSemanticContent(semantic.input) ||
         semanticCorrelation?.runId !== this.#identity.runId ||
         semanticCorrelation.normalizedSessionId !==
           this.#identity.normalizedSessionId ||
@@ -1915,14 +1956,42 @@ export class DurablePrpControlPlane {
     const existing = this.#store.state.committedEvents.find(
       (candidate) => candidate.sourceEventId === sourceEventId,
     );
-    if (existing !== undefined) {
-      if (canonicalJson(existing.envelope) !== canonicalJson(envelope)) {
-        connection.close();
-        return;
-      }
-    } else if (sourceSeq !== this.#store.state.ackedSourceSeq + 1) {
+    if (
+      existing === undefined
+        ? sourceSeq !== this.#store.state.ackedSourceSeq + 1
+        : sourceSeq !== existing.sourceSeq
+    ) {
       connection.close();
       return;
+    }
+    if (
+      isSemanticInput &&
+      semantic !== undefined &&
+      (semantic.content as Record<string, unknown>).digest !==
+        digestPaperclipSemanticContent(semantic.input)
+    ) {
+      // Only the authenticated, schema-valid, exactly correlated input may
+      // permanently fail its owner. Never commit, dispatch, or ACK these bytes.
+      // Keep the same error latched across reconnects; lifecycle command results
+      // remain available so the owner can still attempt a verified suspension.
+      this.#failProtocolIntegrity(
+        connection,
+        new NativeSessionProtocolIntegrityError(
+          "semantic_input_digest_mismatch",
+        ),
+      );
+      return;
+    }
+    if (existing !== undefined) {
+      if (canonicalJson(existing.envelope) !== canonicalJson(envelope)) {
+        this.#failProtocolIntegrity(
+          connection,
+          new NativeSessionProtocolIntegrityError(
+            "source_event_replay_conflict",
+          ),
+        );
+        return;
+      }
     }
 
     // The caller's durable commit is the acknowledgement authority. A crash
@@ -1932,7 +2001,18 @@ export class DurablePrpControlPlane {
     // an uncommitted event disappear from the runner outbox permanently.
     try {
       await this.#onCommittedEvent?.(event);
-    } catch {
+    } catch (error) {
+      if (error instanceof NativeSessionProtocolIntegrityError) {
+        this.#failProtocolIntegrity(connection, error);
+      } else {
+        connection.close();
+      }
+      return;
+    }
+    // Another authenticated connection can replace this one while its commit
+    // is in flight. Once that exact owner has faulted, even a prior successful
+    // commit cannot reopen delivery or invoke a new business operation.
+    if (this.#protocolIntegrityError !== null) {
       connection.close();
       return;
     }

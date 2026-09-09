@@ -14,6 +14,7 @@ import type {
   PersistedHarnessSession,
   PersistedHarnessTurnTerminal,
 } from "../../contracts/harness-driver.js";
+import { NativeSessionProtocolIntegrityError } from "../../contracts/native-session-backend.js";
 import { HarnessReconciliationError } from "../../contracts/harness-driver.js";
 import {
   CODEX_CODEX_PROTOCOL_VERSION,
@@ -307,6 +308,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       // work during close; when no durable provider identity exists that
       // cleanup can fail independently.
       await cancellation.close().catch(() => {});
+      if (error instanceof NativeSessionProtocolIntegrityError) throw error;
       if (input.signal?.aborted) input.signal.throwIfAborted();
       throw error;
     } finally {
@@ -596,6 +598,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       };
     } catch (error) {
       await cancellation.close().catch(() => {});
+      if (error instanceof NativeSessionProtocolIntegrityError) throw error;
       if (options.signal.aborted) options.signal.throwIfAborted();
       return { recovered: false, reason: redactCodexDiagnostic(String(error)) };
     } finally {
@@ -653,6 +656,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         },
       };
     } catch (cause) {
+      if (cause instanceof NativeSessionProtocolIntegrityError) throw cause;
       const error = new Error(
         `planning_mode_unsupported: installed Codex app-server did not expose a usable native plan collaboration mode (${redactCodexDiagnostic(String(cause))})`,
       );
@@ -702,6 +706,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       const response = await transport.request("thread/goal/get", { threadId });
       return parseThreadGoal(response.goal);
     } catch (error) {
+      if (error instanceof NativeSessionProtocolIntegrityError) throw error;
       const policyDisabled =
         error instanceof CodexRpcError
         && (error.message.toLowerCase().includes("policy")

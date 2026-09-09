@@ -15,6 +15,18 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, it, vi } from "vitest";
+import type { ControlPlanePort } from "../contracts/control-plane-port.js";
+import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
+import type {
+  NativeSession,
+  NativeSessionBackend,
+} from "../contracts/native-session-backend.js";
+import type {
+  PrpEvent,
+  PrpStructuredRunResult,
+  PrpTerminalState,
+} from "../protocol/replay-contract.js";
+import { executeNativeSession } from "../native-session-runtime.js";
 import type { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
 
 import {
@@ -46,6 +58,7 @@ import {
   latestRunnerdSessionReadiness,
   rehydrateRunnerdGoalNotification,
   rehydrateRunnerdItemNotification,
+  rehydrateRunnerdDeltaNotification,
   rehydrateRunnerdPlanNotification,
   rehydrateRunnerdResultNotification,
   rehydrateRunnerdThreadTokenUsage,
@@ -1158,6 +1171,11 @@ it("binds a durable semantic result to the active provider turn", () => {
   });
 });
 
+it("restores provider identity and streamed text from a canonical delta", () => {
+  expect(rehydrateRunnerdDeltaNotification({ text: "Reading Gmail", itemId: "message-1", turnId: "controller-turn" }, "root-thread", "provider-turn"))
+    .toMatchObject({ threadId: "root-thread", turnId: "provider-turn", delta: "Reading Gmail", itemId: "message-1" });
+});
+
 it("rehydrates a canonical agent item for the strict Codex facade", () => {
   expect(
     rehydrateRunnerdItemNotification(
@@ -1936,6 +1954,247 @@ it("continues rehydrating events after the committed-event window slides", async
     await rm(stateDirectory, { recursive: true, force: true });
   }
 }, 30_000);
+
+it("does not retry a real memoized transport close whose suspension proof is unavailable", async () => {
+  const identity = {
+    runId: "run-recovery",
+    sessionId: "session-recovery",
+    companyId: "company-recovery",
+    issueId: "issue-recovery",
+    agentId: "agent-recovery",
+  };
+
+  const result: PrpStructuredRunResult = {
+    schema: "paperclip.run_result.v1",
+    reportedWorkDisposition: "done",
+    summary: "Recovered native work completed.",
+    completionClaim: {
+      contractRevision: "1",
+      objectiveSatisfied: true,
+      criteria: [
+        { criterionId: "objective", status: "satisfied", evidenceRefs: [] },
+      ],
+      remainingWork: [],
+    },
+    evidence: [],
+    verification: [{ commandOrCheck: "recovery", status: "passed" }],
+    attentionRequests: [],
+    artifacts: [],
+  };
+
+  const terminal: PrpTerminalState = {
+    schema: "paperclip.prp.terminal.v1",
+    turnTerminalState: "completed",
+    runTerminalState: "succeeded",
+    reportedWorkDisposition: "done",
+  };
+
+  const input: NativeExecutionInputV1 = {
+    schema: "paperclip.native-execution-input.v1",
+    binding: {
+      companyId: identity.companyId,
+      runId: identity.runId,
+      issueId: identity.issueId,
+      agentId: identity.agentId,
+      executionWorkspaceId: "workspace-recovery",
+    },
+    task: {
+      identifier: "PAP-RECOVERY",
+      title: "Recover native work",
+      description: null,
+      prompt: "# PAP-RECOVERY: Recover native work",
+      workMode: "standard",
+    },
+    workspace: {
+      cwd: "/workspace",
+      repoUrl: null,
+      repoRef: null,
+      branchName: null,
+    },
+    session: {
+      normalizedSessionId: identity.sessionId,
+      driverKind: "codex_app_server",
+      protocolVersion: 1,
+    },
+    provider: { kind: "codex", model: null },
+    completionContract: {
+      id: "contract-recovery",
+      sha256: "contract-recovery-sha",
+      schemaVersion: "paperclip.completion-contract.v1",
+      contract: {
+        revision: "1",
+        objective: "Recover native work",
+        criteria: [{ id: "objective", requirement: "Complete after recovery" }],
+      },
+    },
+    interactionResponses: [],
+    credentialBindings: [],
+  };
+
+  function runnerEvent(
+    sourceSeq: number,
+    eventType: PrpEvent["eventType"],
+    payload: Record<string, unknown> = {},
+  ): PrpEvent {
+    return {
+      schema: "paperclip.prp.event.v1",
+      sourceEventId: `runner-recovery:${identity.runId}:${sourceSeq}`,
+      sourceSeq,
+      sourceInstanceId: "runner-recovery",
+      sourceKind: "runner",
+      runId: identity.runId,
+      normalizedSessionId: identity.sessionId,
+      turnId: "turn-recovery",
+      eventType,
+      schemaVersion: 1,
+      priority: 0,
+      emittedAt: "2026-08-09T00:00:00.000Z",
+      payload,
+    };
+  }
+  const stateDirectory = await mkdtemp(
+    join(tmpdir(), "native-close-quarantine-"),
+  );
+  const readRunnerState = vi.fn(async () => ({
+    schema: "paperclip.runner.durable.state.v1",
+    runnerInstanceId: "runner-close-quarantine",
+    environmentLeaseId: "lease-close-quarantine",
+    runId: identity.runId,
+    normalizedSessionId: identity.sessionId,
+    turnId: "turn-close-quarantine",
+    itemId: "item-close-quarantine",
+    lifecycle: "ready",
+  }));
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: resolve(
+      import.meta.dirname,
+      "../../runner/target/debug/fake-codex-app-server",
+    ),
+    codexArgs: ["--state-file", join(stateDirectory, "fake-codex-state.json")],
+    stateDirectory,
+    closeGraceMs: 400,
+    lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null },
+    prpIdentity: await readRunnerState(),
+    readRunnerState,
+    // A checkpoint owner requires durable suspension proof. A local transport
+    // without a checkpoint can simply terminate its process on close.
+    controlPlaneRegistration: async (authority) => {
+      await authority.start();
+      return {
+        connectUrl: authority.connectUrl,
+        checkpoint: async () => {},
+        release: async () => {},
+      };
+    },
+  });
+  try {
+    await bundle.transport.request("thread/start", {
+      cwd: stateDirectory,
+      dynamicTools: [],
+    });
+    const failedClose = bundle.transport.close();
+    const failure = await failedClose.catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "native_session_close_unrecoverable",
+    });
+    expect(bundle.transport.close()).toBe(failedClose);
+
+    vi.useFakeTimers();
+    const close = vi.fn(({ reason }: { reason: string }) =>
+      bundle.transport.close(reason),
+    );
+    const capabilities = {
+      resume: true,
+      typedEvents: true,
+      steering: false,
+      interruption: true,
+      structuredResult: true,
+    };
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() {
+        return capabilities;
+      },
+      async *events() {
+        yield runnerEvent(1, "turn.completed");
+      },
+      async startTurn() {
+        return { turnId: "turn-recovery" };
+      },
+      async result() {
+        return { result, terminal, turnId: "turn-recovery" };
+      },
+      async snapshot() {
+        return {
+          backendKind: "mock",
+          sessionId: identity.sessionId,
+          identity,
+          providerSessionId: "provider-recovery",
+          cursor: null,
+          activeTurnId: null,
+          pendingRuntimeRequests: [],
+          lineage: [],
+        };
+      },
+      close,
+    };
+    const openSession = vi.fn(async () => session);
+    const backend: NativeSessionBackend = {
+      async descriptor() {
+        return {
+          kind: "mock",
+          name: "real-memoized-close-quarantine",
+          version: "1",
+          capabilities,
+        };
+      },
+      openSession,
+    };
+    const port: ControlPlanePort = {
+      async openRun() {},
+      async checkpointSession() {},
+      async appendEvent() {
+        return {
+          cursor: 1,
+          highestContiguousSourceSeq: 1,
+          disposition: "committed",
+        };
+      },
+      async replayEvents() {
+        return { events: [], highestContiguousSourceSeq: 0 };
+      },
+      async completeRun() {},
+    };
+    const execute = () =>
+      executeNativeSession({
+        input,
+        backend,
+        controlPlane: port,
+        runnerInstanceId: "runner-recovery",
+        controlPlaneInstanceId: "control-recovery",
+        requireSessionCloseBeforeReturn: true,
+      });
+    await expect(execute()).rejects.toBe(failure);
+    const readsAfterClose = readRunnerState.mock.calls.length;
+    await expect(execute()).rejects.toMatchObject({
+      code: "native_session_cleanup_quarantined",
+      recovery: "operator_required",
+    });
+    await vi.advanceTimersByTimeAsync(600_000);
+    await expect(execute()).rejects.toMatchObject({
+      code: "native_session_cleanup_quarantined",
+    });
+    expect(openSession).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+    expect(readRunnerState).toHaveBeenCalledTimes(readsAfterClose);
+  } finally {
+    vi.useRealTimers();
+    await bundle.transport.close().catch(() => undefined);
+    await rm(stateDirectory, { recursive: true, force: true });
+  }
+}, 10_000);
+
 
 it("binds an immediately failed durable turn before exposing its terminal", async () => {
   const stateDirectory = await mkdtemp(

@@ -1,3 +1,4 @@
+import { isCanonicalProviderEventType } from "../provider-events.js";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -34,6 +35,7 @@ import type {
   DurableRecoveryCommittedEvent,
   DurableRecoveryIdentity,
 } from "../contracts/durable-recovery.js";
+import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import type {
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
@@ -1565,6 +1567,22 @@ export function rehydrateRunnerdTurnNotification(
   };
 }
 
+export function rehydrateRunnerdDeltaNotification(
+  rawParams: Record<string, unknown>,
+  openedThreadId: string,
+  activeTurnId: string,
+): Record<string, unknown> {
+  // Canonical PRP events already passed runner identity validation. Restore the
+  // provider binding just as for item starts/completions; the PRP controller
+  // turn is deliberately different from the provider's turn ID.
+  return {
+    ...rawParams,
+    threadId: openedThreadId,
+    turnId: activeTurnId,
+    delta: rawParams.delta ?? rawParams.text,
+  };
+}
+
 export function rehydrateRunnerdItemNotification(
   rawParams: Record<string, unknown>,
   openedThreadId: string,
@@ -2152,6 +2170,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #checkpointProviderIdentityConfirmed = false;
   #turnId = "";
   #turnStartResponsePending = false;
+  #turnStartResponseSettled: Promise<void> = Promise.resolve();
   #turnStartResponseEpoch = 0;
   #observedTurnStartEpoch = 0;
   #expectedProviderTurnId: string | null = null;
@@ -3009,9 +3028,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#controlPlaneRelease = null;
     }
     if (suspensionRequired && !runnerSuspended) {
-      throw new Error(
-        "provider_transport_failed: runner did not durably suspend before checkpoint",
-      );
+      throw new NativeSessionCloseUnrecoverableError();
     }
     if (this.#ownsRoot) rmSync(this.#root, { recursive: true, force: true });
     this.#publish();
@@ -3043,8 +3060,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       identity,
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
-      onSemanticToolInput: async (call) =>
-        unwrapToolResponse(
+      onProtocolIntegrityError: (error) => this.#failTransport(error),
+      onSemanticToolInput: async (call) => {
+        // Semantic input may outrun the facade's turn/start response. Bind it
+        // only after the strict driver has accepted that same provider turn.
+        await this.#turnStartResponseSettled;
+        this.#throwIfFailed();
+        return unwrapToolResponse(
           await this.#handler({
             id: call.callId,
             method: "item/tool/call",
@@ -3064,7 +3086,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                 }
               : {}),
           }),
-        ),
+        );
+      },
       connectionLeaseTtlMs: 60 * 60 * 1_000,
     });
     this.#core = core;
@@ -3694,8 +3717,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       identity,
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
-      onSemanticToolInput: async (call) =>
-        unwrapToolResponse(
+      onProtocolIntegrityError: (error) => this.#failTransport(error),
+      onSemanticToolInput: async (call) => {
+        // Semantic input may outrun the facade's turn/start response. Bind it
+        // only after the strict driver has accepted that same provider turn.
+        await this.#turnStartResponseSettled;
+        this.#throwIfFailed();
+        return unwrapToolResponse(
           await this.#handler({
             id: call.callId,
             method: "item/tool/call",
@@ -3715,7 +3743,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                 }
               : {}),
           }),
-        ),
+        );
+      },
       connectionLeaseTtlMs: 60 * 60 * 1_000,
     });
     this.#core = core;
@@ -3933,6 +3962,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#turnId = pendingTurnId;
     const responseEpoch = ++this.#turnStartResponseEpoch;
     this.#turnStartResponsePending = true;
+    let releaseStartResponse!: () => void;
+    this.#turnStartResponseSettled = new Promise<void>(resolve => { releaseStartResponse = resolve; });
     this.#expectedProviderTurnId = null;
     let responseReady = false;
     try {
@@ -4000,6 +4031,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       return { turn: { id: this.#turnId, status: "inProgress" } };
     } finally {
       if (!responseReady) {
+        releaseStartResponse();
         if (this.#turnStartResponseEpoch === responseEpoch) {
           this.#turnStartResponsePending = false;
           this.#expectedProviderTurnId = null;
@@ -4010,6 +4042,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         // following task so the driver can bind and emit turn.accepted first.
         // The epoch prevents a late release from clearing a newer turn fence.
         const release = setTimeout(() => {
+          releaseStartResponse();
           if (this.#turnStartResponseEpoch !== responseEpoch) return;
           this.#turnStartResponsePending = false;
           this.#expectedProviderTurnId = null;
@@ -4294,7 +4327,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         sessionUpdatePayload,
       );
       const notifications =
-        event.eventType === "provider.event"
+        isCanonicalProviderEventType(event.eventType) && !canonicalMethod
+          ? [{ method: "paperclip/canonicalProviderEvent", params: {
+              ...(this.#threadId ? { threadId: this.#threadId } : {}),
+              ...(this.#turnId ? { turnId: this.#turnId } : {}),
+              eventType: event.eventType, payload: eventPayload,
+              itemId: event.envelope.itemId,
+            } }]
+          : event.eventType === "provider.event"
           ? unwrapRunnerdProviderNotifications(eventPayload)
           : canonicalMethod
             ? expandRunnerdCanonicalNotifications(canonicalMethod, eventPayload)
@@ -4355,6 +4395,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
                   this.#threadId,
                   method,
                 )
+            : event.eventType === "item.delta"
+              ? rehydrateRunnerdDeltaNotification(rawParams, this.#threadId, this.#turnId)
             : event.eventType !== "provider.event" &&
                 (method === "item/started" || method === "item/completed")
               ? rehydrateRunnerdItemNotification(
@@ -4373,7 +4415,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
               : rawParams;
         if (
           params.turnId === undefined &&
-          typeof event.envelope.turnId === "string"
+          typeof event.envelope.turnId === "string" && event.envelope.turnId.length > 0
         ) {
           params.turnId = event.envelope.turnId;
         }
@@ -4696,7 +4738,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         const detail = result.stderr.trim() || result.stdout.trim();
         if (detail) this.#diagnostic(detail.slice(-4_096));
         this.#publish();
-        if (this.#closed || this.#handle !== handle) return;
+        if (this.#closed || this.#failure !== null || this.#handle !== handle)
+          return;
         // A per-turn runner exits after its terminal suffix is durably ACKed.
         // Drain that suffix into the provider-facing queue before classifying
         // process completion; clean terminal exit is the expected lifecycle.
@@ -4735,7 +4778,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         );
       },
       (error) => {
-        if (this.#closed || this.#handle !== handle) return;
+        if (this.#closed || this.#failure !== null || this.#handle !== handle)
+          return;
         if (
           this.#startupComplete &&
           this.options.runnerReconnectGraceMs !== undefined &&
@@ -4763,6 +4807,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (
       this.#runnerRecoveryInProgress ||
       this.#closed ||
+      this.#failure !== null ||
       this.#handle !== failedHandle ||
       this.#core === null ||
       !failedHandle.restart
@@ -4779,7 +4824,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       `runner process disconnected; recovery is allowed for ${graceMs}ms`,
     );
     try {
-      while (!this.#closed && Date.now() < deadline) {
+      while (!this.#closed && this.#failure === null && Date.now() < deadline) {
         if (attempt > 0) {
           const base = delays[Math.min(attempt - 1, delays.length - 1)]!;
           const jittered = Math.max(
@@ -4788,7 +4833,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           );
           await new Promise((resolveWait) => setTimeout(resolveWait, jittered));
         }
-        if (this.#closed) return;
+        if (this.#closed || this.#failure !== null) return;
         if (Date.now() >= deadline) break;
         const priorConnectionCount = this.#core.store.state.connectionCount;
         let recoveredHandle: RunnerProcessHandle;
@@ -4825,7 +4870,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           },
         );
         const authenticated = (async () => {
-          while (!processSettled && !this.#closed && Date.now() < deadline) {
+          while (
+            !processSettled &&
+            !this.#closed &&
+            this.#failure === null &&
+            Date.now() < deadline
+          ) {
             if (
               this.#core !== null &&
               this.#core.store.state.connectionCount > priorConnectionCount &&
@@ -4861,8 +4911,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#rejectFailureSignal(error);
     if (this.#pump !== null) clearInterval(this.#pump);
     this.#pump = null;
-    this.#diagnostic(error.message);
-    this.#queue.close(error);
+    try {
+      this.#diagnostic(error.message);
+    } finally {
+      // An observer is not allowed to leave notification consumers waiting
+      // after the request path has already received this terminal failure.
+      this.#queue.close(error);
+    }
   }
 
   #throwIfFailed(): void {

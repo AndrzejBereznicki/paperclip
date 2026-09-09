@@ -17,12 +17,18 @@ import type {
   NativeSessionBackend,
 } from "./contracts/native-session-backend.js";
 import type { PersistedNativeSession } from "./contracts/native-session-backend.js";
-import type { HarnessThreadGoal } from "./contracts/harness-driver.js";
-import type {
-  PrpEvent,
-  PrpStructuredRunResult,
-  PrpTerminalState,
+import {
+  NativeProviderTerminalFailure,
+  NativeSessionCloseUnrecoverableError,
+  NativeSessionCleanupQuarantinedError,
+  NativeSessionProtocolIntegrityError,
+} from "./contracts/native-session-backend.js";
+import {
+  type PrpEvent,
+  type PrpStructuredRunResult,
+  type PrpTerminalState,
 } from "./protocol/replay-contract.js";
+import type { HarnessThreadGoal } from "./contracts/harness-driver.js";
 import { validatePrpStructuredRunResult } from "./protocol/replay-contract.js";
 import { parsePaperclipQuestionSet } from "./contracts/question-set.js";
 
@@ -70,6 +76,7 @@ interface QuarantinedSessionCleanup {
   recovery: Promise<void> | null;
   recoveryMaxAttempts: number | null;
   timer: ReturnType<typeof setTimeout> | null;
+  operatorRecoveryRequired: boolean;
 }
 
 const quarantinedSessionCleanups = new Set<QuarantinedSessionCleanup>();
@@ -349,6 +356,10 @@ function retainUnadmittedSessionCleanup(
         await attempt;
         return;
       } catch (error) {
+        if (error instanceof NativeSessionCloseUnrecoverableError) {
+          quarantineSessionCleanup(session, cleanupDomain, true);
+          throw error;
+        }
         if (retryCount >= MAX_FAILED_SESSION_CLOSE_RETRIES) {
           quarantineSessionCleanup(session, cleanupDomain);
           throw error;
@@ -508,10 +519,17 @@ function retainFailedSessionCleanupOwner(
 function quarantineSessionCleanup(
   session: NativeSession,
   cleanupDomain: NativeSessionCleanupDomain,
+  operatorRecoveryRequired = false,
 ): void {
-  if (
-    [...quarantinedSessionCleanups].some((entry) => entry.session === session)
-  ) {
+  const existing = [...quarantinedSessionCleanups].find(
+    (entry) => entry.session === session,
+  );
+  if (existing) {
+    if (operatorRecoveryRequired) {
+      existing.operatorRecoveryRequired = true;
+      if (existing.timer) clearTimeout(existing.timer);
+      existing.timer = null;
+    }
     return;
   }
   const cleanup: QuarantinedSessionCleanup = {
@@ -522,8 +540,10 @@ function quarantineSessionCleanup(
     recovery: null,
     recoveryMaxAttempts: null,
     timer: null,
+    operatorRecoveryRequired,
   };
   quarantinedSessionCleanups.add(cleanup);
+  if (operatorRecoveryRequired) return;
   startQuarantinedSessionCleanupRecovery(
     cleanup,
     MAX_QUARANTINED_SESSION_CLOSE_RETRIES,
@@ -537,6 +557,7 @@ function startQuarantinedSessionCleanupRecovery(
   reason: string,
 ): Promise<void> {
   if (cleanup.recovery) return cleanup.recovery;
+  if (cleanup.operatorRecoveryRequired) return Promise.resolve();
   const remainingAttempts =
     MAX_QUARANTINED_SESSION_AUTOMATIC_CLOSE_ATTEMPTS -
     cleanup.automaticAttempts;
@@ -546,7 +567,8 @@ function startQuarantinedSessionCleanupRecovery(
     for (
       let attemptCount = 0;
       attemptCount < boundedMaxAttempts &&
-      quarantinedSessionCleanups.has(cleanup);
+      quarantinedSessionCleanups.has(cleanup) &&
+      !cleanup.operatorRecoveryRequired;
       attemptCount += 1
     ) {
       // The first retry starts immediately so an admission-triggered recovery
@@ -563,7 +585,10 @@ function startQuarantinedSessionCleanupRecovery(
       try {
         await attempt;
         quarantinedSessionCleanups.delete(cleanup);
-      } catch {
+      } catch (error) {
+        if (error instanceof NativeSessionCloseUnrecoverableError) {
+          cleanup.operatorRecoveryRequired = true;
+        }
         // Retain the quarantine after this finite, sequential retry batch.
       } finally {
         if (cleanup.attempt === attempt) cleanup.attempt = null;
@@ -591,6 +616,7 @@ function scheduleQuarantinedSessionCleanup(
 ): void {
   if (
     !quarantinedSessionCleanups.has(cleanup) ||
+    cleanup.operatorRecoveryRequired ||
     cleanup.recovery ||
     cleanup.attempt ||
     cleanup.timer ||
@@ -628,6 +654,14 @@ async function retryQuarantinedSessionCleanups(
   let observedOwnerPhases = 0;
   while (true) {
     signal?.throwIfAborted();
+    if (
+      [...quarantinedSessionCleanups].some(
+        (cleanup) =>
+          cleanup.domain === cleanupDomain && cleanup.operatorRecoveryRequired,
+      )
+    ) {
+      throw new NativeSessionCleanupQuarantinedError();
+    }
     const cleanupOwners = new Set<Promise<void>>(
       [...failedSessionCleanupOwners]
         .filter(([, domain]) => domain === cleanupDomain)
@@ -785,6 +819,7 @@ async function consumeTurn(
       typeof semanticResultGraceExpired
     > | null = null;
     let pendingNext: ReturnType<typeof eventIterator.next> | null = null;
+    let providerFailure: NativeProviderTerminalFailure | null = null;
     const settleDurableResult = (
       event: PrpEvent,
       result: PrpStructuredRunResult,
@@ -812,7 +847,7 @@ async function consumeTurn(
       };
     };
     while (true) {
-      pendingNext ??= eventIterator.next();
+      pendingNext ??= eventIterator.next().catch(error => { throw providerFailure ?? error; });
       const next =
         semanticResultDeadline === null
           ? await pendingNext
@@ -843,6 +878,7 @@ async function consumeTurn(
             governedResult,
           };
         }
+        if (providerFailure) throw providerFailure;
         throw new Error(
           "native event stream closed before a turn terminal fact",
         );
@@ -900,6 +936,15 @@ async function consumeTurn(
       if (event.eventType === "run.result.proposed") {
         const validation = validatePrpStructuredRunResult(event.payload);
         if (validation.ok) semanticResultProposal = validation.result;
+      }
+      if (event.eventType === "session.failed") {
+        const failure = payload.error && typeof payload.error === "object"
+          ? payload.error as Record<string, unknown> : payload;
+        providerFailure = new NativeProviderTerminalFailure(
+          typeof failure.code === "string" ? failure.code : "provider_session_failed",
+          failure.recoverable === true || payload.recoverable === true,
+          typeof failure.message === "string" ? failure.message : undefined,
+        );
       }
       const request =
         payload.request &&
@@ -1811,6 +1856,9 @@ export async function executeNativeSession(
     const failedProviderSession =
       providerRecoveryCheckpoint.terminal?.runTerminalState === "failed" &&
       providerRecoveryCheckpoint.semanticResult === null;
+    if (failedProviderSession && !replacementAllowed) {
+      throw new NativeProviderTerminalFailure("provider_checkpoint_failed_terminal", false);
+    }
     const recovery = failedProviderSession
       ? {
           recovered: false as const,
@@ -1969,6 +2017,10 @@ export async function executeNativeSession(
             await attempt;
             return;
           } catch (error) {
+            if (error instanceof NativeSessionCloseUnrecoverableError) {
+              quarantineSessionCleanup(session, cleanupDomain, true);
+              throw error;
+            }
             if (retryCount >= MAX_FAILED_SESSION_CLOSE_RETRIES) {
               quarantineSessionCleanup(session, cleanupDomain);
               throw error;
@@ -2004,6 +2056,7 @@ export async function executeNativeSession(
   let goalCheckpointRequiresSuspension = Boolean(
     options.sessionGoalControl || options.resumeSessionGoalHeartbeat || persistedSession?.goal,
   );
+  let protocolIntegrityFailure: NativeSessionProtocolIntegrityError | null = null;
   try {
     // Ownership publication is part of the execution-owned lifetime. If the
     // callback fails, the finally block below still quarantines and closes the
@@ -2246,8 +2299,16 @@ export async function executeNativeSession(
         // before joining cleanup so the failed turn cannot commit late or
         // strand execution on a never-settling durability call.
         consumptionAbort.abort(error);
-        await consuming.catch(() => undefined);
-        throw error;
+        let startupFailure = error;
+        await consuming.catch((consumptionError) => {
+          // A failed iterator may have already initiated close while start or
+          // checkpoint was pending. Retain the authenticated integrity fault,
+          // not the resulting transport/cleanup error from that race.
+          if (consumptionError instanceof NativeSessionProtocolIntegrityError) {
+            startupFailure = consumptionError;
+          }
+        });
+        throw startupFailure;
       }
       const terminalEvent = await consuming;
       consumed = terminalEvent;
@@ -2279,6 +2340,17 @@ export async function executeNativeSession(
                   turnId: terminalEvent.turnId ?? null,
                 };
           signal.throwIfAborted();
+          if (settledCompletion === null && terminalEvent.eventType === "turn.failed") {
+            await checkpoint(signal);
+            const payload = terminalEvent.payload as Record<string, unknown>;
+            const failure = payload.error && typeof payload.error === "object" ? payload.error as Record<string, unknown> : payload;
+            const message = typeof failure.message === "string" ? failure.message.slice(0, 2_000) : "Provider turn failed";
+            throw new NativeProviderTerminalFailure(
+              typeof failure.code === "string" ? failure.code : "provider_turn_failed",
+              failure.recoverable === true || payload.recoverable === true,
+              message,
+            );
+          }
           if (settledCompletion === null && options.resolveMissingResult) {
             const recoveredResult = await options.resolveMissingResult({
               turnId: terminalEvent.turnId ?? null,
@@ -2304,13 +2376,6 @@ export async function executeNativeSession(
           completed = settledCompletion;
         }
         if (settledCompletion === null) {
-          if (consumed.event?.eventType === "turn.failed") {
-            const providerError = objectRecord(objectRecord(consumed.event.payload)?.error);
-            const message = typeof providerError?.message === "string"
-              ? providerError.message.slice(0, 2_000) : "Provider turn failed";
-            const modelRejected = /issue with the selected model|model_not_found|invalid model|model[^\n]*(?:does not exist|not found|not supported)/i.test(message);
-            throw new Error(`${modelRejected ? "native_provider_model_rejected" : "native_provider_turn_failed"}: ${message}`);
-          }
           throw new Error(
             "native_finalization_missing: session returned no semantic result",
           );
@@ -2372,6 +2437,7 @@ export async function executeNativeSession(
     const baselineControlEventSequences = new Set<number>();
     const accountedControlEventSequences = new Set<number>();
     let baselineControlReplayCaptured = false;
+    let completionAdmissionStarted = false;
     const durableExecutionResult = await finalizeIdempotentControlPlaneWithin({
       timeoutMs: finalizationTimeoutMs,
       operation: async (signal) => {
@@ -2438,6 +2504,23 @@ export async function executeNativeSession(
             consumed.highestContiguousSourceSeq,
             receipt.highestContiguousSourceSeq,
           );
+        }
+        if (!completionAdmissionStarted) {
+          // Replay/appends can yield after the prepared result's last snapshot.
+          // Observe the driver's latched integrity fault once more before
+          // admitting completion; Codex snapshots inspect local state only.
+          try {
+            await session.snapshot({ signal });
+          } catch (error) {
+            if (error instanceof NativeSessionProtocolIntegrityError) throw error;
+            // Generic snapshot failures remain checkpoint enrichment failures,
+            // not evidence that the already validated result is invalid.
+          }
+          signal.throwIfAborted();
+          // Invocation is the local admission boundary, not an atomic fence
+          // with the remote commit. A lost acknowledgement can mean committed
+          // success, so later faults must not veto its idempotent confirmation.
+          completionAdmissionStarted = true;
         }
         await options.controlPlane.completeRun(
           {
@@ -2538,6 +2621,11 @@ export async function executeNativeSession(
     };
     executionSucceeded = true;
     return { ...durableExecutionResult, ...enrichment };
+  } catch (error) {
+    if (error instanceof NativeSessionProtocolIntegrityError) {
+      protocolIntegrityFailure = error;
+    }
+    throw error;
   } finally {
     const shouldClose =
       !options.keepSessionOpen || !executionSucceeded || sessionQuarantined || goalCheckpointRequiresSuspension;
@@ -2555,7 +2643,14 @@ export async function executeNativeSession(
         // Unlike ordinary provider cleanup, this close owns required remote
         // checkpoint persistence. Exhausting its bounded recovery must fail
         // the execution instead of converting the rejection into success.
-        await requiredClose;
+        try {
+          await requiredClose;
+        } catch (closeError) {
+          // The exact cleanup owner remains retained/quarantined above. Its
+          // rejection must not turn permanent integrity failure into a
+          // generic retryable transport failure at the control-plane boundary.
+          throw protocolIntegrityFailure ?? closeError;
+        }
       }
     } else if (shouldClose && !failedCleanupDeferred) {
       // A provider that ignores close must not keep execution pending forever.

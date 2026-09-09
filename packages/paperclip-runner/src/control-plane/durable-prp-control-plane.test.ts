@@ -15,8 +15,10 @@ import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
+import { createCapabilityRunnerdCodexTransport } from "../live/runnerd-codex-transport.js";
 import { validatePrpEvent } from "../protocol/replay-contract.js";
 import { digestPaperclipSemanticContent } from "../semantic-tools/receipts.js";
 import {
@@ -689,10 +691,13 @@ async function authenticate(
   controlPlane: DurablePrpControlPlane,
   token: string,
   selectedIdentity: DurableRecoveryIdentity = identity,
+  runnerDigest = expectedRunnerDigest,
 ): Promise<AuthenticatedClient | null> {
   const { socket, reader } = await upgradeSocket(controlPlane.connectUrl);
   const material = credentialMaterial(token);
-  sendMaskedJson(socket, authHello(material.credentialId, selectedIdentity));
+  const hello = authHello(material.credentialId, selectedIdentity);
+  (hello.payload as Record<string, unknown>).runnerDigest = runnerDigest;
+  sendMaskedJson(socket, hello);
   const challenge = await reader.next();
   if (challenge === null) return null;
   const challengePayload = challenge.payload as Record<string, unknown>;
@@ -877,7 +882,529 @@ function semanticInputEvent(sourceSeq = 1): Record<string, unknown> {
   };
 }
 
+function corruptSemanticInputDigest(
+  event = semanticInputEvent(),
+): Record<string, unknown> {
+  const payload = (event.payload as Record<string, unknown>).payload as Record<
+    string,
+    unknown
+  >;
+  const semantic = payload.semantic_tool as Record<string, unknown>;
+  (semantic.content as Record<string, unknown>).digest =
+    `sha256:${"0".repeat(64)}`;
+  return event;
+}
+
 describe.sequential("DurablePrpControlPlane", () => {
+  it.each([false, true])(
+    "promptly fails the real transport request and notification paths on authenticated bad semantic input (throwing observer: %s)",
+    async (throwingObserver) => {
+      const root = mkdtempSync(
+        resolve(tmpdir(), "paperclip-prp-transport-integrity-"),
+      );
+      let authority: DurablePrpControlPlane | undefined;
+      let launched = false;
+      const diagnostics: string[] = [];
+      // The launcher below is synthetic; use the current executable only as
+      // its artifact identity, without depending on a staged Rust build.
+      const runnerBinary = process.execPath;
+      const runnerDigest = `sha256:${createHash("sha256").update(readFileSync(runnerBinary)).digest("hex")}`;
+      const handler = vi.fn(async () => ({ success: true, contentItems: [] }));
+      const bundle = createCapabilityRunnerdCodexTransport({
+        stateDirectory: root,
+        prpIdentity: identity,
+        runnerBinary,
+        codexCommand: process.execPath,
+        codexArgs: [],
+        sourceCodexHome: null,
+        environment: {},
+        runnerReconnectGraceMs: 900_000,
+        onDiagnostic: (message) => {
+          diagnostics.push(message);
+          if (
+            throwingObserver &&
+            message.includes("native_event_replay_conflict")
+          ) {
+            throw new Error("diagnostic observer failed");
+          }
+        },
+        controlPlaneRegistration: async (core) => {
+          authority = core;
+          await core.start();
+          return { connectUrl: core.connectUrl, release: () => core.stop() };
+        },
+        // Only the runner process is synthetic. Authentication, encrypted frames,
+        // authority validation, transport latching, and both consumers are real.
+        runnerProcessLauncher: () => {
+          launched = true;
+          return {
+            child: { exitCode: null, kill: () => true },
+            completion: new Promise(() => undefined),
+          };
+        },
+      });
+      bundle.transport.setServerRequestHandler(handler);
+      const requestFailure = bundle.transport
+        .request("thread/start", { cwd: tmpdir() })
+        .catch((error: unknown) => error);
+      const notificationFailure = (async () => {
+        for await (const _notification of bundle.transport.notifications()) {
+          // No provider content is expected before startup completes.
+        }
+        return null;
+      })().catch((error: unknown) => error);
+      try {
+        await vi.waitFor(() => expect(launched).toBe(true));
+        const core = authority!;
+        const client = (await authenticate(
+          core,
+          core.issueBootstrapTicket(),
+          identity,
+          runnerDigest,
+        ))!;
+        const event = corruptSemanticInputDigest();
+        const semantic = (
+          (event.payload as Record<string, unknown>).payload as Record<
+            string,
+            unknown
+          >
+        ).semantic_tool as Record<string, unknown>;
+        semantic.input = { summary: "DO-NOT-LEAK-integrity-test" };
+        sendSecure(client, event);
+        await expect(receiveSecure(client)).resolves.toBeNull();
+        const requestError = await requestFailure;
+        expect(requestError).toBeInstanceOf(
+          NativeSessionProtocolIntegrityError,
+        );
+        expect(await notificationFailure).toBe(requestError);
+        await expect(bundle.transport.request("initialize", {})).rejects.toBe(
+          requestError,
+        );
+        expect(handler).not.toHaveBeenCalled();
+        expect(core.store.state.ackedSourceSeq).toBe(0);
+        expect(core.store.state.committedEvents).toEqual([]);
+        expect(diagnostics.join("\n")).not.toContain("DO-NOT-LEAK");
+        expect(
+          diagnostics.filter((message) =>
+            message.includes("native_event_replay_conflict"),
+          ),
+        ).toHaveLength(1);
+      } finally {
+        await bundle.detachControllerForRestart();
+        await authority?.stop();
+        await Promise.allSettled([requestFailure, notificationFailure]);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("latches an authenticated semantic integrity fault without ACK or dispatch and still permits suspension", async () => {
+    const root = mkdtempSync(resolve(tmpdir(), "paperclip-prp-integrity-"));
+    const onProtocolIntegrityError = vi.fn();
+    const onCommittedEvent = vi.fn(async () => undefined);
+    const onSemanticToolInput = vi.fn(async () => ({ result: { ok: true } }));
+    const core = new DurablePrpControlPlane({
+      stateDirectory: root,
+      identity,
+      expectedRunnerVersion,
+      expectedRunnerDigest,
+      onProtocolIntegrityError,
+      onCommittedEvent,
+      onSemanticToolInput,
+    });
+    try {
+      await core.start();
+      const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+      sendSecure(client, corruptSemanticInputDigest());
+      await expect(receiveSecure(client)).resolves.toBeNull();
+      expect(onProtocolIntegrityError).toHaveBeenCalledTimes(1);
+      const error = onProtocolIntegrityError.mock.calls[0]![0];
+      expect(error).toBeInstanceOf(NativeSessionProtocolIntegrityError);
+      expect(error).toMatchObject({
+        code: "native_event_replay_conflict",
+        reason: "semantic_input_digest_mismatch",
+        recovery: "operator_required",
+      });
+      expect(core.store.state.ackedSourceSeq).toBe(0);
+      expect(core.store.state.committedEvents).toEqual([]);
+      expect(onCommittedEvent).not.toHaveBeenCalled();
+      expect(onSemanticToolInput).not.toHaveBeenCalled();
+
+      // A reconnect cannot reclassify this owner as healthy, even if it now
+      // supplies valid bytes for the failed sequence. Its callback is one-shot.
+      const replay = (await authenticate(core, client.leaseToken!))!;
+      sendSecure(replay, semanticInputEvent());
+      await expect(receiveSecure(replay)).resolves.toBeNull();
+      expect(onProtocolIntegrityError).toHaveBeenCalledTimes(1);
+      expect(core.store.state.ackedSourceSeq).toBe(0);
+      expect(onCommittedEvent).not.toHaveBeenCalled();
+      expect(onSemanticToolInput).not.toHaveBeenCalled();
+      expect(() =>
+        core.rotateRunIdentity({ ...identity, runId: "other-run" }),
+      ).toThrow(error);
+
+      const suspend = core.queueCommand(
+        "runner.suspend",
+        {},
+        "suspend-after-integrity-fault",
+      );
+      const cleanup = (await authenticate(core, client.leaseToken!))!;
+      expect(cleanup.welcome.payload).toMatchObject({
+        pendingCommands: [
+          expect.objectContaining({ commandId: suspend.commandId }),
+        ],
+      });
+      sendSecure(cleanup, {
+        protocol: "paperclip.runner",
+        version: 1,
+        kind: "command_result",
+        payload: {
+          commandId: suspend.commandId,
+          commandType: suspend.type,
+          controllerSeq: suspend.controllerSeq,
+          status: "completed",
+          result: { suspended: true },
+        },
+      });
+      await expect(receiveSecure(cleanup)).resolves.toMatchObject({
+        kind: "command_result_ack",
+      });
+      expect(core.store.state.commands[0]?.status).toBe("completed");
+      expect(core.store.state.ackedSourceSeq).toBe(0);
+      cleanup.socket.destroy();
+    } finally {
+      await core.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "semantic_input_digest_mismatch",
+    "source_event_replay_conflict",
+  ] as const)(
+    "preserves a typed integrity fault from the trusted commit boundary (%s)",
+    async (reason) => {
+      const root = mkdtempSync(
+        resolve(tmpdir(), "paperclip-prp-typed-commit-integrity-"),
+      );
+      const error = new NativeSessionProtocolIntegrityError(reason);
+      const onProtocolIntegrityError = vi.fn();
+      const onCommittedEvent = vi.fn(async () => {
+        throw error;
+      });
+      const onSemanticToolInput = vi.fn(async () => ({ result: { ok: true } }));
+      const core = new DurablePrpControlPlane({
+        stateDirectory: root,
+        identity,
+        expectedRunnerVersion,
+        expectedRunnerDigest,
+        onProtocolIntegrityError,
+        onCommittedEvent,
+        onSemanticToolInput,
+      });
+      try {
+        await core.start();
+        const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+        sendSecure(client, semanticInputEvent());
+        await expect(receiveSecure(client)).resolves.toBeNull();
+        expect(onProtocolIntegrityError).toHaveBeenCalledExactlyOnceWith(error);
+        expect(core.store.state.ackedSourceSeq).toBe(0);
+        expect(onSemanticToolInput).not.toHaveBeenCalled();
+        const retry = (await authenticate(core, client.leaseToken!))!;
+        sendSecure(retry, semanticInputEvent());
+        await expect(receiveSecure(retry)).resolves.toBeNull();
+        expect(onProtocolIntegrityError).toHaveBeenCalledExactlyOnceWith(error);
+        expect(onCommittedEvent).toHaveBeenCalledTimes(1);
+      } finally {
+        await core.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("latches an authenticated replay conflict against exactly committed bytes", async () => {
+    const root = mkdtempSync(
+      resolve(tmpdir(), "paperclip-prp-replay-integrity-"),
+    );
+    const onProtocolIntegrityError = vi.fn();
+    const onCommittedEvent = vi.fn(async () => undefined);
+    const onSemanticToolInput = vi.fn(
+      async () => new Promise<{ result: unknown }>(() => undefined),
+    );
+    const core = new DurablePrpControlPlane({
+      stateDirectory: root,
+      identity,
+      expectedRunnerVersion,
+      expectedRunnerDigest,
+      onProtocolIntegrityError,
+      onCommittedEvent,
+      onSemanticToolInput,
+    });
+    try {
+      await core.start();
+      const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+      sendSecure(client, semanticInputEvent());
+      await expect(receiveSecure(client)).resolves.toMatchObject({
+        kind: "ack",
+        payload: { ackedSourceSeq: 1 },
+      });
+      const changed = semanticInputEvent();
+      const semantic = (
+        (changed.payload as Record<string, unknown>).payload as Record<
+          string,
+          unknown
+        >
+      ).semantic_tool as Record<string, unknown>;
+      semantic.input = { changed: true };
+      (semantic.content as Record<string, unknown>).digest =
+        digestPaperclipSemanticContent(semantic.input);
+      sendSecure(client, changed);
+      await expect(receiveSecure(client)).resolves.toBeNull();
+      expect(onProtocolIntegrityError).toHaveBeenCalledTimes(1);
+      expect(onProtocolIntegrityError.mock.calls[0]![0]).toBeInstanceOf(
+        NativeSessionProtocolIntegrityError,
+      );
+      expect(onProtocolIntegrityError.mock.calls[0]![0]).toMatchObject({
+        reason: "source_event_replay_conflict",
+      });
+      expect(onCommittedEvent).toHaveBeenCalledTimes(1);
+      expect(onSemanticToolInput).toHaveBeenCalledTimes(1);
+      expect(core.store.state.ackedSourceSeq).toBe(1);
+      expect(core.store.state.committedEvents).toHaveLength(1);
+      expect(core.store.state.committedEvents[0]?.envelope).toEqual(
+        semanticInputEvent(),
+      );
+    } finally {
+      await core.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    "unauthenticated",
+    "envelope_runner",
+    "envelope_environment",
+    "envelope_run",
+    "envelope_session",
+    "envelope_turn",
+    "envelope_item",
+    "event_run",
+    "event_runner",
+    "event_session",
+    "event_turn",
+    "event_item",
+    "source_seq_gap",
+    "semantic_run",
+    "semantic_session",
+    "semantic_turn",
+    "semantic_item",
+    "malformed_semantic",
+  ])(
+    "rejects %s malformed input without poisoning the legitimate owner",
+    async (mismatch) => {
+      const root = mkdtempSync(
+        resolve(tmpdir(), "paperclip-prp-unbound-integrity-"),
+      );
+      const onProtocolIntegrityError = vi.fn();
+      const onCommittedEvent = vi.fn(async () => undefined);
+      const onSemanticToolInput = vi.fn(async () => ({ result: { ok: true } }));
+      const core = new DurablePrpControlPlane({
+        stateDirectory: root,
+        identity,
+        expectedRunnerVersion,
+        expectedRunnerDigest,
+        onProtocolIntegrityError,
+        onCommittedEvent,
+        onSemanticToolInput,
+      });
+      try {
+        await core.start();
+        const event = corruptSemanticInputDigest();
+        const canonical = event.payload as Record<string, unknown>;
+        const semantic = (canonical.payload as Record<string, unknown>)
+          .semantic_tool as Record<string, unknown>;
+        if (mismatch.startsWith("envelope_")) {
+          const key = {
+            envelope_runner: "runnerInstanceId",
+            envelope_environment: "environmentLeaseId",
+            envelope_run: "runId",
+            envelope_session: "normalizedSessionId",
+            envelope_turn: "turnId",
+            envelope_item: "itemId",
+          }[mismatch]!;
+          event[key] = "another-owner";
+        } else if (mismatch.startsWith("event_")) {
+          const key = {
+            event_runner: "sourceInstanceId",
+            event_run: "runId",
+            event_session: "normalizedSessionId",
+            event_turn: "turnId",
+            event_item: "itemId",
+          }[mismatch]!;
+          canonical[key] = "another-owner";
+        } else if (mismatch === "source_seq_gap") canonical.sourceSeq = 2;
+        else if (mismatch === "malformed_semantic") delete semantic.callId;
+        else if (mismatch.startsWith("semantic_")) {
+          const key = {
+            semantic_run: "runId",
+            semantic_session: "normalizedSessionId",
+            semantic_turn: "turnId",
+            semantic_item: "itemId",
+          }[mismatch]!;
+          (semantic.correlation as Record<string, unknown>)[key] =
+            "another-owner";
+        }
+        if (mismatch === "unauthenticated") {
+          const client = await upgradeSocket(core.connectUrl);
+          sendMaskedJson(client.socket, event);
+          await expect(client.reader.next()).resolves.toBeNull();
+        } else {
+          const client = (await authenticate(
+            core,
+            core.issueBootstrapTicket(),
+          ))!;
+          sendSecure(client, event);
+          await expect(receiveSecure(client)).resolves.toBeNull();
+        }
+        expect(onProtocolIntegrityError).not.toHaveBeenCalled();
+        expect(onCommittedEvent).not.toHaveBeenCalled();
+        expect(onSemanticToolInput).not.toHaveBeenCalled();
+        const legitimate = (await authenticate(
+          core,
+          core.issueBootstrapTicket(),
+        ))!;
+        sendSecure(legitimate, semanticInputEvent());
+        await expect(receiveSecure(legitimate)).resolves.toMatchObject({
+          kind: "ack",
+          payload: { ackedSourceSeq: 1 },
+        });
+        expect(onProtocolIntegrityError).not.toHaveBeenCalled();
+        expect(onCommittedEvent).toHaveBeenCalledTimes(1);
+        expect(onSemanticToolInput).toHaveBeenCalledTimes(1);
+        legitimate.socket.destroy();
+      } finally {
+        await core.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("does not dispatch an earlier in-flight commit after a replacement connection proves an integrity fault", async () => {
+    const root = mkdtempSync(
+      resolve(tmpdir(), "paperclip-prp-integrity-commit-race-"),
+    );
+    let releaseCommit!: () => void;
+    const commitBarrier = new Promise<void>((resolveCommit) => {
+      releaseCommit = resolveCommit;
+    });
+    const onCommittedEvent = vi.fn(async () => commitBarrier);
+    const onProtocolIntegrityError = vi.fn();
+    const onSemanticToolInput = vi.fn(async () => ({ result: { ok: true } }));
+    const core = new DurablePrpControlPlane({
+      stateDirectory: root,
+      identity,
+      expectedRunnerVersion,
+      expectedRunnerDigest,
+      onCommittedEvent,
+      onProtocolIntegrityError,
+      onSemanticToolInput,
+    });
+    try {
+      await core.start();
+      const first = (await authenticate(core, core.issueBootstrapTicket()))!;
+      sendSecure(first, semanticInputEvent());
+      await vi.waitFor(() => expect(onCommittedEvent).toHaveBeenCalledTimes(1));
+      const replacement = (await authenticate(core, first.leaseToken!))!;
+      sendSecure(replacement, corruptSemanticInputDigest());
+      await expect(receiveSecure(replacement)).resolves.toBeNull();
+      expect(onProtocolIntegrityError).toHaveBeenCalledTimes(1);
+      releaseCommit();
+      await new Promise<void>((resolveTurn) => setImmediate(resolveTurn));
+      expect(core.store.state.ackedSourceSeq).toBe(0);
+      expect(core.store.state.committedEvents).toEqual([]);
+      expect(onSemanticToolInput).not.toHaveBeenCalled();
+    } finally {
+      releaseCommit();
+      await core.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not turn a missing semantic handler into an integrity fault", async () => {
+    const root = mkdtempSync(
+      resolve(tmpdir(), "paperclip-prp-integrity-no-handler-"),
+    );
+    const onProtocolIntegrityError = vi.fn();
+    const core = new DurablePrpControlPlane({
+      stateDirectory: root,
+      identity,
+      expectedRunnerVersion,
+      expectedRunnerDigest,
+      onProtocolIntegrityError,
+    });
+    try {
+      await core.start();
+      const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+      sendSecure(client, corruptSemanticInputDigest());
+      await expect(receiveSecure(client)).resolves.toBeNull();
+      expect(onProtocolIntegrityError).not.toHaveBeenCalled();
+      expect(core.store.state.ackedSourceSeq).toBe(0);
+    } finally {
+      await core.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    new Error("database temporarily unavailable"),
+    Object.assign(new Error("untrusted native_event_replay_conflict prose"), {
+      code: "native_event_replay_conflict",
+    }),
+  ])(
+    "keeps a non-typed commit failure retryable on the same authenticated authority (%s)",
+    async (commitFailure) => {
+      const root = mkdtempSync(
+        resolve(tmpdir(), "paperclip-prp-transient-commit-"),
+      );
+      const onProtocolIntegrityError = vi.fn();
+      const onCommittedEvent = vi
+        .fn()
+        .mockRejectedValueOnce(commitFailure)
+        .mockResolvedValue(undefined);
+      const onSemanticToolInput = vi.fn(async () => ({ result: { ok: true } }));
+      const core = new DurablePrpControlPlane({
+        stateDirectory: root,
+        identity,
+        expectedRunnerVersion,
+        expectedRunnerDigest,
+        onProtocolIntegrityError,
+        onCommittedEvent,
+        onSemanticToolInput,
+      });
+      try {
+        await core.start();
+        const first = (await authenticate(core, core.issueBootstrapTicket()))!;
+        sendSecure(first, semanticInputEvent());
+        await expect(receiveSecure(first)).resolves.toBeNull();
+        expect(core.store.state.ackedSourceSeq).toBe(0);
+        expect(onSemanticToolInput).not.toHaveBeenCalled();
+        const retry = (await authenticate(core, first.leaseToken!))!;
+        sendSecure(retry, semanticInputEvent());
+        await expect(receiveSecure(retry)).resolves.toMatchObject({
+          kind: "ack",
+          payload: { ackedSourceSeq: 1 },
+        });
+        expect(onProtocolIntegrityError).not.toHaveBeenCalled();
+        expect(onCommittedEvent).toHaveBeenCalledTimes(2);
+        expect(onSemanticToolInput).toHaveBeenCalledTimes(1);
+        retry.socket.destroy();
+      } finally {
+        await core.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("exchanges a one-use bootstrap for a run-bound reconnect lease", async () => {
     const root = mkdtempSync(resolve(tmpdir(), "paperclip-prp-auth-"));
     const controlPlane = new DurablePrpControlPlane({
