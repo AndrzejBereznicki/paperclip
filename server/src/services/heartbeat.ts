@@ -7232,6 +7232,18 @@ export async function buildPaperclipWakePayload(input: {
           source: readNonEmptyString(agentMessage.source),
           pluginKey: readNonEmptyString(agentMessage.pluginKey),
           sessionId: readNonEmptyString(agentMessage.sessionId),
+          ...(Array.isArray(agentMessage.untrustedToolResults) ? {
+            untrustedToolResults: agentMessage.untrustedToolResults.slice(0, 8).map((value) => {
+              const result = parseObject(value);
+              return {
+                actionRequestId: sanitizeAgentSessionMessageText(result.actionRequestId) ?? "",
+                toolName: sanitizeAgentSessionMessageText(result.toolName) ?? "",
+                resultSummary: sanitizeAgentSessionMessageText(result.resultSummary) ?? "",
+                error: sanitizeAgentSessionMessageText(result.error),
+                declineReason: sanitizeAgentSessionMessageText(result.declineReason),
+              };
+            }),
+          } : {}),
         }
       : null,
     childIssueSummaries: Array.isArray(
@@ -20192,7 +20204,9 @@ export function heartbeatService(
                 issueId: issueRef.id,
                 runId: run.id,
                 agentId: agent.id,
-                interactionIds: interactionId ? [interactionId] : [],
+                interactionIds: Array.isArray(context.interactionIds)
+                  ? [...new Set([...(interactionId ? [interactionId] : []), ...context.interactionIds.filter((id): id is string => typeof id === "string")])]
+                  : interactionId ? [interactionId] : [],
               });
             const runnerAdapterConfig = parseObject(agent.adapterConfig);
             const managedProfile =

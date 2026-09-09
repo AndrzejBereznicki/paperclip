@@ -1317,6 +1317,7 @@ type IssueDetailChatTabProps = {
     interaction: ActionableIssueThreadInteraction,
     selectedClientKeys?: string[],
     selectedOptionIds?: string[],
+    rememberAction?: boolean,
   ) => Promise<void>;
   onRejectInteraction: (
     interaction: ActionableIssueThreadInteraction,
@@ -2990,6 +2991,9 @@ export function IssueDetail() {
     queryKey: queryKeys.issues.interactions(issueId!),
     queryFn: () => issuesApi.listInteractions(issueId!),
     enabled: !!issueId,
+    // A review can be committed between the initial fetch and live-socket
+    // subscription. Reconcile even after its originating run has ended.
+    refetchInterval: 20_000,
     placeholderData: keepPreviousDataForSameQueryTail<IssueThreadInteraction[]>(
       issueId ?? "pending",
     ),
@@ -4424,14 +4428,17 @@ export function IssueDetail() {
       interaction,
       selectedClientKeys,
       selectedOptionIds,
+      rememberAction,
     }: {
       interaction: ActionableIssueThreadInteraction;
       selectedClientKeys?: string[];
       selectedOptionIds?: string[];
+      rememberAction?: boolean;
     }) =>
       issuesApi.acceptInteraction(issueId!, interaction.id, {
         selectedClientKeys,
         selectedOptionIds,
+        rememberAction,
       }),
     onSuccess: (interaction) => {
       upsertInteractionInCache(interaction);
@@ -6079,11 +6086,13 @@ export function IssueDetail() {
       interaction: ActionableIssueThreadInteraction,
       selectedClientKeys?: string[],
       selectedOptionIds?: string[],
+    rememberAction?: boolean,
     ) => {
       await acceptInteraction.mutateAsync({
         interaction,
         selectedClientKeys,
         selectedOptionIds,
+        rememberAction,
       });
     },
     [acceptInteraction],

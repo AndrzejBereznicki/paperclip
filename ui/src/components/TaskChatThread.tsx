@@ -2306,10 +2306,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     [interruptingQueuedRunId, onInterruptQueued],
   );
 
+  const reopenToolReview = useCallback((interactionId: string) => {
+    setSelectedPendingKey(`interaction:${interactionId}`);
+    setTakeoverMode("open");
+  }, []);
+
   const renderInteraction = useCallback(
     (item: TaskChatInteractionItem) => (
       <TaskChatInteractionCard
         item={item}
+        onReviewRequest={reopenToolReview}
         planDocument={planDocument}
         showPlanPreview={
           !threadOwnsPlanPreview(
@@ -2349,6 +2355,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       planDocumentSourceRunId,
       settledRunIds,
       tailRunId,
+      reopenToolReview,
     ],
   );
 
@@ -2396,6 +2403,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       ? {
           id: selectedPendingInput.key,
           label: selectedPendingInput.label,
+          hideLabel: selectedPendingInput.kind === "durable" && selectedPendingInput.interaction.kind === "request_confirmation" && Boolean(selectedPendingInput.interaction.payload.toolAction),
           pendingCount: pendingComposerInputs.length,
           content: takeoverContent,
           onDismiss: () => setTakeoverMode("normal"),
