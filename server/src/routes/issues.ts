@@ -123,6 +123,7 @@ import {
   type IssueRelationIssueSummary,
   type IssueReviewPolicy,
   type IssueThreadInteractionCanonicalResolverPolicy,
+  type IssueComment,
   type IssueCommentPresentation,
   type IssueQueuedCommentQueue,
   type IssueWatchdogDiscoveryKind,
@@ -179,7 +180,13 @@ import {
 } from "../services/runner-goals.js";
 import { queueLiveRunnerPrpCommand } from "../realtime/runner-prp-ws.js";
 import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
-import { emitAgentTaskRun } from "../services/agent-task-run-telemetry.js";
+import { emitAgentTaskRunById } from "../services/agent-task-run-telemetry.js";
+import {
+  createQueuedCommentQueue,
+  QueuedCommentMutationError,
+  QueuedCommentMutationForbiddenError,
+  type QueuedCommentIssueContext,
+} from "../modules/wake-queue/index.js";
 import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import {
@@ -330,8 +337,9 @@ import {
   steerNativeSession,
 } from "../services/native-runtime/native-session-executor.js";
 import {
+  buildQueuedCommentQueueSnapshot,
+  decideQueuedCommentQueueSteering,
   queuedCommentIdsFromWakePayload,
-  withQueuedCommentIdsInRunContext,
   withQueuedCommentIdsInWakePayload,
 } from "../services/issue-queued-comment-queue.js";
 
@@ -3689,6 +3697,11 @@ export function issueRoutes(
     enabled: async () =>
       (await instanceSettings.getExperimental()).enableExternalObjects === true,
   });
+  const queuedCommentQueue = createQueuedCommentQueue(db, {
+    syncCommentReferences: (commentId, tx) => issueReferencesSvc.syncComment(commentId, tx),
+    deleteCommentReferenceSource: (commentId, tx) => issueReferencesSvc.deleteCommentSource(commentId, tx),
+    syncCommentExternalObjectsSafely: (commentId, tx) => externalObjectsSvc.syncCommentSafely(commentId, tx),
+  });
   const routinesSvc = routineService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
@@ -6747,24 +6760,6 @@ export function issueRoutes(
     queueRun: IssueQueueRun | null;
   };
 
-  function queueRevision(input: {
-    wake: IssueQueueWake | null;
-    comments: Array<{ id: string; updatedAt: Date }>;
-  }): string {
-    return createHash("sha256")
-      .update(
-        JSON.stringify({
-          queueId: input.wake?.id ?? null,
-          comments: input.comments.map((comment) => [
-            comment.id,
-            comment.updatedAt.toISOString(),
-          ]),
-        }),
-      )
-      .digest("hex")
-      .slice(0, 32);
-  }
-
   async function findQueuedCommentWake(
     executor: IssueQueueDb,
     issue: { id: string; companyId: string; assigneeAgentId: string | null },
@@ -6865,53 +6860,31 @@ export function issueRoutes(
           .limit(1)
           .then((rows) => rows[0] ?? null)
       : null;
-    const persistedRuntimeMode =
-      queueState?.state === "queued" && queueState.queueRun
-        ? queueState.queueRun.runtimeMode
-        : queueState?.state === "deferred" && input.activeRun
-          ? input.activeRun.runtimeMode
-          : null;
-    const protocol =
-      persistedRuntimeMode === "native" ||
-      (persistedRuntimeMode === null &&
-        assignedAgent?.adapterType === "paperclip_runner")
-        ? ("paperclip_runner_v1" as const)
-        : ("legacy" as const);
-    const steeringRun =
-      queueState?.state === "deferred" ? input.activeRun : null;
-    let steeringDisposition =
-      input.steeringDisposition ??
-      (protocol === "paperclip_runner_v1" && steeringRun
-        ? await getNativeSessionSteeringState(steeringRun.id)
+    const steering = decideQueuedCommentQueueSteering({
+      state: queueState?.state ?? null,
+      queueRunRuntimeMode: queueState?.state === "queued" ? queueState.queueRun?.runtimeMode ?? null : null,
+      activeRun: input.activeRun,
+      assignedAgentAdapterType: assignedAgent?.adapterType ?? null,
+      queuedCommentCount: comments.length,
+    });
+    const steeringDisposition: IssueQueuedCommentQueue["steeringDisposition"] =
+      steering.kind !== "probe"
+        ? steering.kind
+        : input.steeringDisposition
+          ?? (await getNativeSessionSteeringState(steering.steeringRunId)
             .then((state) => state.disposition)
-            .catch(() => "temporarily_unavailable" as const)
-        : ("unsupported" as const));
-    if (
-      protocol === "paperclip_runner_v1" &&
-      (!steeringRun || comments.length === 0)
-    ) {
-      steeringDisposition = "temporarily_unavailable";
-    }
-    return {
+            .catch(() => "temporarily_unavailable" as const));
+    return buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
       queueId: wake?.id ?? null,
       state: queueState?.state ?? null,
-      targetRunId: steeringRun?.id ?? null,
-      revision: queueRevision({ wake, comments }),
-      protocol,
+      activeRunId: input.activeRun?.id ?? null,
+      protocol: steering.protocol,
       steeringDisposition,
-      entries: comments.map((comment, position) => ({
-        comment:
-          comment as IssueQueuedCommentQueue["entries"][number]["comment"],
-        position,
-        canEdit:
-          input.actor.actorType === "user" &&
-          comment.authorUserId === input.actor.actorId,
-        canDiscard:
-          input.actor.actorType === "user" &&
-          comment.authorUserId === input.actor.actorId,
-      })),
-    };
+      comments,
+      actorType: input.actor.actorType,
+      actorId: input.actor.actorId,
+    });
   }
 
   function assertQueueMutationTarget(input: {
@@ -7063,211 +7036,7 @@ export function issueRoutes(
     return { activeRun, wake, queueRun, state, queue, queueState };
   }
 
-  async function updateQueuedRunCommentIds(
-    tx: IssueQueueTx,
-    queueRun: IssueQueueRun | null,
-    ids: string[],
-    updatedAt: Date,
-  ) {
-    if (!queueRun) return null;
-    const updated = await tx
-      .update(heartbeatRuns)
-      .set({
-        contextSnapshot: withQueuedCommentIdsInRunContext(
-          queueRun.contextSnapshot,
-          ids,
-        ),
-        updatedAt,
-      })
-      .where(
-        and(
-          eq(heartbeatRuns.id, queueRun.id),
-          eq(heartbeatRuns.status, "queued"),
-        ),
-      )
-      .returning()
-      .then((rows) => rows[0] ?? null);
-    if (!updated) {
-      throw conflict("The queued message is already being dispatched", {
-        code: "queued_comment_already_dispatching",
-      });
-    }
-    return updated;
-  }
-
-  async function discardQueuedComment(input: {
-    issue: {
-      id: string;
-      companyId: string;
-      assigneeAgentId: string | null;
-      executionRunId?: string | null;
-    };
-    actor: ReturnType<typeof getActorInfo>;
-    commentId: string;
-    queueId: string;
-    revision?: string;
-  }) {
-    let cancelledRunToEmit: typeof heartbeatRuns.$inferSelect | null = null;
-    const result = await db.transaction(async (tx) => {
-      const locked = await lockQueuedCommentState({
-        tx,
-        issue: input.issue,
-        actor: input.actor,
-        queueId: input.queueId,
-      });
-      if (input.revision) {
-        assertQueueMutationTarget({
-          queue: locked.queue,
-          queueId: input.queueId,
-          revision: input.revision,
-        });
-      }
-      const entry = locked.queue.entries.find(
-        (candidate) => candidate.comment.id === input.commentId,
-      );
-      if (!entry) {
-        throw conflict("The queued message is no longer pending", {
-          code: "queued_comment_not_pending",
-        });
-      }
-      const actorOwnsEntry =
-        input.actor.actorType === "agent"
-          ? entry.comment.authorAgentId === input.actor.agentId
-          : entry.comment.authorUserId === input.actor.actorId;
-      if (!actorOwnsEntry) {
-        throw forbidden("Only the queued message author can discard it");
-      }
-
-      const deleted = await tx
-        .delete(issueComments)
-        .where(
-          and(
-            eq(issueComments.id, input.commentId),
-            eq(issueComments.issueId, input.issue.id),
-          ),
-        )
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      if (!deleted) {
-        throw conflict("The queued message is no longer pending", {
-          code: "queued_comment_not_pending",
-        });
-      }
-      await issueReferencesSvc.deleteCommentSource(input.commentId, tx);
-      await externalObjectsSvc.syncCommentSafely(input.commentId, tx);
-
-      const remainingIds = locked.queue.entries
-        .map((candidate) => candidate.comment.id)
-        .filter((candidateId) => candidateId !== input.commentId);
-      const now = new Date();
-      let nextQueueState: IssueQueueState | null = null;
-
-      if (remainingIds.length === 0) {
-        await tx
-          .update(agentWakeupRequests)
-          .set({
-            status: "cancelled",
-            finishedAt: now,
-            error: "Queued message discarded before dispatch",
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, locked.wake.id));
-
-        if (locked.queueRun) {
-          const cancelledRun = await tx
-            .update(heartbeatRuns)
-            .set({
-              status: "cancelled",
-              finishedAt: now,
-              error: "Queued message discarded before dispatch",
-              errorCode: "queued_comment_discarded",
-              updatedAt: now,
-            })
-            .where(
-              and(
-                eq(heartbeatRuns.id, locked.queueRun.id),
-                eq(heartbeatRuns.status, "queued"),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
-          if (!cancelledRun) {
-            throw conflict("The queued message is already being dispatched", {
-              code: "queued_comment_already_dispatching",
-            });
-          }
-          cancelledRunToEmit = cancelledRun;
-        }
-      } else {
-        const updatedWake = await tx
-          .update(agentWakeupRequests)
-          .set({
-            payload: withQueuedCommentIdsInWakePayload(
-              locked.wake.payload,
-              remainingIds,
-            ),
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, locked.wake.id))
-          .returning()
-          .then((rows) => rows[0] ?? locked.wake);
-        const updatedQueueRun = await updateQueuedRunCommentIds(
-          tx,
-          locked.queueRun,
-          remainingIds,
-          now,
-        );
-        nextQueueState = {
-          wake: updatedWake,
-          state: locked.state,
-          queueRun: updatedQueueRun ?? locked.queueRun,
-        };
-      }
-
-      await tx
-        .update(issueRows)
-        .set({
-          ...(locked.queueRun && remainingIds.length === 0
-            ? {
-                executionRunId: null,
-                executionAgentNameKey: null,
-                executionLockedAt: null,
-              }
-            : {}),
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issueRows.id, input.issue.id),
-            locked.queueRun && remainingIds.length === 0
-              ? eq(issueRows.executionRunId, locked.queueRun.id)
-              : undefined,
-          ),
-        );
-
-      return {
-        deleted,
-        queue: await buildQueuedCommentQueue({
-          executor: tx,
-          issue: input.issue,
-          activeRun: locked.activeRun,
-          actor: input.actor,
-          queueState: nextQueueState,
-        }),
-      };
-    });
-    // Telemetry is best-effort background work; it must not delay the
-    // response with a slow lookup, so fire it and do not await it.
-    if (cancelledRunToEmit) {
-      void emitAgentTaskRun(db, cancelledRunToEmit);
-    }
-    return result;
-  }
-
-  function operatorInterruptCancelOptions(input: {
-    issueId: string;
-    actor: ReturnType<typeof getActorInfo>;
-  }) {
+  function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
     return {
       errorCode: "operator_interrupted",
       resultJson: {
@@ -15300,6 +15069,41 @@ export function issueRoutes(
     );
   });
 
+  /** Maps a wake-queue queued-comment mutation error onto the same HTTP error the route threw before this mutation moved into the module. */
+  function throwForQueuedCommentMutationError(error: unknown): never {
+    if (error instanceof QueuedCommentMutationError) {
+      throw conflict(error.message, { code: error.code });
+    }
+    if (error instanceof QueuedCommentMutationForbiddenError) {
+      throw forbidden(error.message);
+    }
+    throw error;
+  }
+
+  /** Builds the four-field issue context every queued-comment queue mutation call site passes, from the route's already-loaded issue. */
+  function buildQueuedCommentIssueContext(issue: {
+    id: string;
+    companyId: string;
+    assigneeAgentId: string | null;
+    executionRunId: string | null | undefined;
+  }): QueuedCommentIssueContext {
+    return {
+      id: issue.id,
+      companyId: issue.companyId,
+      assigneeAgentId: issue.assigneeAgentId,
+      executionRunId: issue.executionRunId ?? null,
+    };
+  }
+
+  /** Runs a queued-comment queue mutation and maps its error onto the route's HTTP error, so each call site is a `const`. */
+  async function runQueuedCommentMutation<T>(run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (error) {
+      throwForQueuedCommentMutationError(error);
+    }
+  }
+
   router.get("/issues/:id/queued-comments", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(
@@ -15337,70 +15141,18 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
-      const queue = await db.transaction(async (tx) => {
-        const locked = await lockQueuedCommentState({
-          tx,
-          issue,
+      const queue = await runQueuedCommentMutation(() =>
+        queuedCommentQueue.editQueuedComment({
+          issue: buildQueuedCommentIssueContext(issue),
           actor,
-          queueId: req.body.queueId,
-        });
-        assertQueueMutationTarget({
-          queue: locked.queue,
+          commentId,
           queueId: req.body.queueId,
           revision: req.body.revision,
-        });
-        const entry = locked.queue.entries.find(
-          (candidate) => candidate.comment.id === commentId,
-        );
-        if (!entry)
-          throw conflict("The queued message is no longer pending", {
-            code: "queued_comment_not_pending",
-          });
-        if (!entry.canEdit)
-          throw forbidden("Only the queued message author can edit it");
-        const updatedAt = new Date();
-        const updated = await tx
-          .update(issueComments)
-          .set({ body: req.body.body, updatedAt })
-          .where(
-            and(
-              eq(issueComments.id, commentId),
-              eq(issueComments.issueId, issue.id),
-            ),
-          )
-          .returning({ id: issueComments.id })
-          .then((rows) => rows[0] ?? null);
-        if (!updated)
-          throw conflict("The queued message is no longer pending", {
-            code: "queued_comment_not_pending",
-          });
-        await tx
-          .update(issueRows)
-          .set({ updatedAt })
-          .where(eq(issueRows.id, issue.id));
-        await issueReferencesSvc.syncComment(commentId, tx);
-        await externalObjectsSvc.syncCommentSafely(commentId, tx);
-        const updatedQueueRun = await updateQueuedRunCommentIds(
-          tx,
-          locked.queueRun,
-          locked.queue.entries.map((candidate) => candidate.comment.id),
-          updatedAt,
-        );
-        return buildQueuedCommentQueue({
-          executor: tx,
-          issue,
-          activeRun: locked.activeRun,
-          actor,
-          queueState: {
-            wake: locked.wake,
-            state: locked.state,
-            queueRun: updatedQueueRun ?? locked.queueRun,
-          },
-        });
-      });
-      res.json(
-        await runRedactions.redactForIssue(issue.companyId, issue.id, queue),
+          body: req.body.body,
+          now: new Date(),
+        }),
       );
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
     },
   );
 
@@ -15419,69 +15171,17 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
-      const queue = await db.transaction(async (tx) => {
-        const locked = await lockQueuedCommentState({
-          tx,
-          issue,
+      const queue = await runQueuedCommentMutation(() =>
+        queuedCommentQueue.reorderQueuedComments({
+          issue: buildQueuedCommentIssueContext(issue),
           actor,
-          queueId: req.body.queueId,
-        });
-        assertQueueMutationTarget({
-          queue: locked.queue,
           queueId: req.body.queueId,
           revision: req.body.revision,
-        });
-        const currentIds = locked.queue.entries.map(
-          (entry) => entry.comment.id,
-        );
-        const orderedIds = req.body.orderedCommentIds as string[];
-        const orderedSet = new Set(orderedIds);
-        if (
-          orderedSet.size !== orderedIds.length ||
-          orderedIds.length !== currentIds.length ||
-          currentIds.some((commentId) => !orderedSet.has(commentId))
-        ) {
-          throw conflict(
-            "The queued message order does not match the current queue",
-            {
-              code: "queued_comment_order_mismatch",
-            },
-          );
-        }
-        const now = new Date();
-        const updatedWake = await tx
-          .update(agentWakeupRequests)
-          .set({
-            payload: withQueuedCommentIdsInWakePayload(
-              locked.wake.payload,
-              orderedIds,
-            ),
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, locked.wake.id))
-          .returning()
-          .then((rows) => rows[0] ?? locked.wake);
-        const updatedQueueRun = await updateQueuedRunCommentIds(
-          tx,
-          locked.queueRun,
-          orderedIds,
-          now,
-        );
-        return buildQueuedCommentQueue({
-          executor: tx,
-          issue,
-          activeRun: locked.activeRun,
-          actor,
-          queueState: {
-            wake: updatedWake,
-            state: locked.state,
-            queueRun: updatedQueueRun ?? locked.queueRun,
-          },
-        });
-      });
-      res.json(
-        await runRedactions.redactForIssue(issue.companyId, issue.id, queue),
+          orderedCommentIds: req.body.orderedCommentIds as string[],
+          now: new Date(),
+        }),
       );
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
     },
   );
 
@@ -15759,16 +15459,22 @@ export function issueRoutes(
       );
       if (!issue) return;
       const actor = getActorInfo(req);
-      const { queue } = await discardQueuedComment({
-        issue,
-        actor,
-        commentId,
-        queueId: req.body.queueId,
-        revision: req.body.revision,
-      });
-      res.json(
-        await runRedactions.redactForIssue(issue.companyId, issue.id, queue),
+      const result = await runQueuedCommentMutation(() =>
+        queuedCommentQueue.discardQueuedComment({
+          issue: buildQueuedCommentIssueContext(issue),
+          actor,
+          commentId,
+          queueId: req.body.queueId,
+          revision: req.body.revision,
+          now: new Date(),
+        }),
       );
+      // Telemetry is best-effort background work; it must not delay the
+      // response with a slow lookup, so fire it and do not await it.
+      if (result.cancelledRun) {
+        void emitAgentTaskRunById(db, { runId: result.cancelledRun.id, companyId: issue.companyId });
+      }
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, result.queue));
     },
   );
 
@@ -16932,20 +16638,25 @@ export function issueRoutes(
         return;
       }
 
-      const queueWakeForCancellation =
-        deleteMode === "cancel" ? authoritativeQueueWake : pendingQueueWake;
-      const removed = queueWakeForCancellation
-        ? (
-            await discardQueuedComment({
-              issue,
+      const queueWakeForCancellation = deleteMode === "cancel"
+        ? authoritativeQueueWake
+        : pendingQueueWake;
+      let removed: IssueComment | null;
+      if (queueWakeForCancellation) {
+        removed = (
+          await runQueuedCommentMutation(() =>
+            queuedCommentQueue.discardQueuedComment({
+              issue: buildQueuedCommentIssueContext(issue),
               actor,
               commentId,
               queueId: queueWakeForCancellation.id,
-            })
-          ).deleted
-        : activeRun && isLegacyQueuedComment
-          ? await svc.removeComment(commentId)
-          : null;
+              now: new Date(),
+            }),
+          )
+        ).deleted;
+      } else {
+        removed = activeRun && isLegacyQueuedComment ? await svc.removeComment(commentId) : null;
+      }
       if (!removed) {
         res.status(409).json({
           error: activeRun
@@ -16954,7 +16665,6 @@ export function issueRoutes(
         });
         return;
       }
-
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
