@@ -47,6 +47,7 @@ import { cn, SIDEBAR_RAIL_HIDDEN_LABEL } from "../lib/utils";
 import { PluginSlotOutlet } from "@/plugins/slots";
 import { PluginLauncherOutlet } from "@/plugins/launchers";
 import { SidebarCompanyMenu } from "./SidebarCompanyMenu";
+import { ClaudeUsageIndicator } from "./ClaudeUsageIndicator";
 
 export function Sidebar() {
   const { openNewIssue } = useDialogActions();
@@ -291,6 +292,8 @@ export function Sidebar() {
           missingBehavior="placeholder"
         />
       </nav>
+
+      <ClaudeUsageIndicator companyId={selectedCompanyId} rail={rail} />
     </aside>
   );
 }

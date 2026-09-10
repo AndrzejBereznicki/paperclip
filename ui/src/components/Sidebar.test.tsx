@@ -112,6 +112,10 @@ vi.mock("./SidebarStarredProjects", () => ({
   SidebarStarredProjects: () => <div data-testid="sidebar-starred-projects" />,
 }));
 
+vi.mock("./ClaudeUsageIndicator", () => ({
+  ClaudeUsageIndicator: () => <div data-testid="claude-usage-indicator" />,
+}));
+
 async function flushReact() {
   for (let index = 0; index < 5; index += 1) {
     await Promise.resolve();
