@@ -49,6 +49,7 @@ import { PluginSlotOutlet } from "@/plugins/slots";
 import { PluginLauncherOutlet } from "@/plugins/launchers";
 import { SidebarCompanyMenu } from "./SidebarCompanyMenu";
 import { primarySidebarStyles } from "./primary-sidebar-styles";
+import { ClaudeUsageIndicator } from "./ClaudeUsageIndicator";
 
 export function Sidebar({ children }: { children?: ReactNode }) {
   const { openNewIssue } = useDialogActions();
@@ -309,6 +310,8 @@ export function Sidebar({ children }: { children?: ReactNode }) {
           missingBehavior="placeholder"
         />
       </nav>
+
+      <ClaudeUsageIndicator companyId={selectedCompanyId} rail={rail} />
     </aside>
   );
 }
