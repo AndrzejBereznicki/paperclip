@@ -3,6 +3,7 @@ import {
   decidePreDrain,
   decideQueuedCommentAction,
   decideReleaseRecovery,
+  decideWakeAdmission,
   decideWakeOutcome,
   deriveImmediateRecoveryContextLabels,
   type DeferredWakeOutcomeFacts,
@@ -10,6 +11,7 @@ import {
   type ImmediateRecoveryContextLabels,
   type PreDrainFacts,
   type ReleaseRecoveryFacts,
+  type WakeAdmissionFacts,
 } from "./policy.js";
 
 const basePreDrainFacts: PreDrainFacts = {
@@ -492,6 +494,53 @@ describe("deriveImmediateRecoveryContextLabels", () => {
   for (const testCase of cases) {
     it(testCase.name, () => {
       expect(deriveImmediateRecoveryContextLabels(testCase.issueStatus)).toEqual(testCase.expected);
+    });
+  }
+});
+
+const baseWakeAdmissionFacts: WakeAdmissionFacts = {
+  isSameExecutionAgent: true,
+  shouldDeferFollowupWake: false,
+  shouldQueueFollowupForRunningWake: false,
+  availableActiveExecutionRunPresent: true,
+};
+
+describe("decideWakeAdmission", () => {
+  const cases: Array<{
+    name: string;
+    facts: WakeAdmissionFacts;
+    expected: ReturnType<typeof decideWakeAdmission>;
+  }> = [
+    {
+      name: "coalesce: same execution agent, no defer condition, and a live coalesce target",
+      facts: baseWakeAdmissionFacts,
+      expected: { kind: "coalesce" },
+    },
+    {
+      name: "defer: same execution agent, but the running agent needs a fresh session",
+      facts: { ...baseWakeAdmissionFacts, shouldDeferFollowupWake: true },
+      expected: { kind: "defer" },
+    },
+    {
+      name: "defer: same execution agent, but the running turn must finish first",
+      facts: { ...baseWakeAdmissionFacts, shouldQueueFollowupForRunningWake: true },
+      expected: { kind: "defer" },
+    },
+    {
+      name: "defer: a different agent already holds the execution lock",
+      facts: { ...baseWakeAdmissionFacts, isSameExecutionAgent: false },
+      expected: { kind: "defer" },
+    },
+    {
+      name: "proceed: the zombie-run filter leaves no live coalesce target",
+      facts: { ...baseWakeAdmissionFacts, availableActiveExecutionRunPresent: false },
+      expected: { kind: "proceed" },
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(testCase.name, () => {
+      expect(decideWakeAdmission(testCase.facts)).toEqual(testCase.expected);
     });
   }
 });
