@@ -5,7 +5,7 @@
 # 2. Instalacja, testy naszych zmian, build UI.
 # 3. Nowy katalog pkg-<wersja> z npm + nasze pliki serwera (esbuild) + nasz ui-dist, test importu.
 # 4. Stan "ready_to_switch" -> serwer sam sie restartuje, a switch-paperclip.ps1 podmienia wersje.
-# Konflikt / blad testow / buildu -> nic nie jest podmieniane, stan "failed" + zadanie w Paperclip.
+# Konflikt / blad testow / buildu -> nic nie jest podmieniane, stan "failed"; serwer zaklada zadanie w Paperclip.
 #
 # Test na sucho: instance.json -> test.installVersion (zainstaluj istniejaca wersje zamiast docelowej)
 # i test.breakAt = "build" (celowo zepsuty build) albo "startup" (nowa wersja nie wstaje -> wycofanie).
@@ -24,7 +24,7 @@ $installVersion = if ($Cfg.test.installVersion) { $Cfg.test.installVersion } els
 $newPkg  = if ($Cfg.test.installVersion) { "pkg-$TargetVersion-test-$stamp" } else { "pkg-$TargetVersion" }
 $newBranch = if ($Cfg.test.installVersion) { "eai-test-$stamp" } else { "eai-$TargetVersion" }
 $workLog = Join-Path $Root "update-$stamp.log"
-$state = @{ state = 'preparing'; targetVersion = $TargetVersion; fromVersion = $fromMeta.version; pkg = $newPkg; log = $workLog }
+$state = @{ state = 'preparing'; targetVersion = $TargetVersion; fromVersion = $fromMeta.version; pkg = $newPkg; branch = $newBranch; log = $workLog }
 
 function Step([string]$text) {
   $state.step = $text
@@ -164,11 +164,7 @@ catch {
   $state.state = 'failed'
   $state.message = "Nieudany krok: $($state.step) - $msg. Nic nie zostalo podmienione."
   Write-UpdateState $state
-  $issue = New-PaperclipIssue "Aktualizacja Paperclip do $TargetVersion wymaga recznej pracy" (
-    "Automatyczna aktualizacja z banera zatrzymala sie przed podmiana wersji. Serwer dziala dalej na $($fromMeta.version).`n`n" +
-    "- Krok: $($state.step)`n- Blad: $msg`n- Galaz w forku: $newBranch (repo $repo)`n- Log: $workLog`n`n" +
-    "Do zrobienia: rozwiazac problem na galezi $newBranch (np. konflikt cherry-pick), zbudowac i podmienic wersje wg EKS-277.")
-  if ($issue) { $state.issue = $issue; Write-UpdateState $state }
+  # zadanie dla czlowieka zaklada serwer (widzi stan "failed" w pliku)
   exit 1
 }
 finally {
