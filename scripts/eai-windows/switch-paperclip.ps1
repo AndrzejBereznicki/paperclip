@@ -24,7 +24,7 @@ $state   = @{ state = 'switching'; targetVersion = $target; fromVersion = $from;
 function Fail-Hard([string]$msg, [string]$final = 'failed') {
   $state.state = $final; $state.message = $msg; Write-UpdateState $state
   Log ('switch: ' + $msg)
-  $issue = New-PaperclipIssue "Aktualizacja Paperclip do $target wymaga recznej pracy" (
+  $issue = New-PaperclipIssue "Aktualizacja Paperclip do $target nie wstala - wymaga recznej pracy" (
     "$msg`n`n- Poprzedni pkg: $oldPkg`n- Nowy pkg: $newPkg`n- Kopia bazy sprzed podmiany: $dbBak`n- Log: $LogFile")
   if ($issue) { $state.issue = $issue; Write-UpdateState $state }
 }
