@@ -55,6 +55,15 @@ import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 
 const execFileAsync = promisify(execFile);
 
+// On Windows `npm` is a .cmd shim; execFile cannot spawn it directly (ENOENT, or
+// EINVAL for `npm.cmd` on recent Node), so route it through cmd.exe there.
+function execNpm(args: string[], options: { cwd: string; timeout: number }) {
+  if (process.platform === "win32") {
+    return execFileAsync(process.env.ComSpec || "cmd.exe", ["/d", "/c", "npm.cmd", ...args], options);
+  }
+  return execFileAsync("npm", args, options);
+}
+
 /**
  * Floor: on cloud-managed instances adapter code is bundled into the platform
  * image; fetching and loading external adapter packages at runtime stays off
@@ -338,7 +347,7 @@ export function adapterRoutes(options: {
 
         logger.info({ spec, pluginsDir }, "Installing adapter package via npm");
 
-        await execFileAsync("npm", ["install", "--no-save", spec], {
+        await execNpm(["install", "--no-save", spec], {
           cwd: pluginsDir,
           timeout: 120_000,
         });
@@ -557,7 +566,7 @@ export function adapterRoutes(options: {
     if (externalRecord.packageName && !externalRecord.localPath) {
       try {
         const pluginsDir = getAdapterPluginsDir();
-        await execFileAsync("npm", ["uninstall", externalRecord.packageName], {
+        await execNpm(["uninstall", externalRecord.packageName], {
           cwd: pluginsDir,
           timeout: 60_000,
         });
@@ -673,7 +682,7 @@ export function adapterRoutes(options: {
 
       logger.info({ type, packageName: record.packageName }, "Reinstalling adapter package via npm");
 
-      await execFileAsync("npm", ["install", "--no-save", record.packageName], {
+      await execNpm(["install", "--no-save", record.packageName], {
         cwd: pluginsDir,
         timeout: 120_000,
       });
