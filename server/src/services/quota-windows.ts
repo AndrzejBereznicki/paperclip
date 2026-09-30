@@ -21,6 +21,36 @@ function providerSlugForAdapterType(type: string): string {
  * letting one provider's outage block the entire response.
  */
 export async function fetchAllQuotaWindows(): Promise<ProviderQuotaResult[]> {
+  // Every open UI tab polls this; the Anthropic usage API answers 429 when hit too often.
+  // Share one upstream call per QUOTA_CACHE_MS and keep showing the last good windows on errors.
+  if (cached && Date.now() - cached.at < QUOTA_CACHE_MS) return cached.results;
+  inFlight ??= fetchFresh().finally(() => {
+    inFlight = null;
+  });
+  return inFlight;
+}
+
+const QUOTA_CACHE_MS = 120_000;
+const LAST_GOOD_MAX_AGE_MS = 6 * 60 * 60_000;
+let cached: { at: number; results: ProviderQuotaResult[] } | null = null;
+let inFlight: Promise<ProviderQuotaResult[]> | null = null;
+const lastGood = new Map<string, { at: number; result: ProviderQuotaResult }>();
+
+async function fetchFresh(): Promise<ProviderQuotaResult[]> {
+  const now = Date.now();
+  const results = (await fetchAllQuotaWindowsUncached()).map((result) => {
+    if (result.ok && result.windows.length > 0) {
+      lastGood.set(result.provider, { at: now, result });
+      return result;
+    }
+    const good = lastGood.get(result.provider);
+    return good && now - good.at < LAST_GOOD_MAX_AGE_MS ? good.result : result;
+  });
+  cached = { at: now, results };
+  return results;
+}
+
+async function fetchAllQuotaWindowsUncached(): Promise<ProviderQuotaResult[]> {
   const adapters = listServerAdapters().filter((a) => a.getQuotaWindows != null);
 
   const settled = await Promise.allSettled(
