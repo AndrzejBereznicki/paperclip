@@ -22,7 +22,16 @@ $st = Read-UpdateState
 if ($st -and $st.state -eq 'ready_to_switch') {
   Log ("restart z UI: aktualizacja do " + $st.targetVersion + " - uruchamiam podmiane wersji")
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'switch-paperclip.ps1')
-  exit $LASTEXITCODE
+  $code = $LASTEXITCODE
+  # Skrypt podmiany padl, zanim cokolwiek zapisal -> bez tego serwer restartowalby sie w petli.
+  $after = Read-UpdateState
+  if ($after -and $after.state -eq 'ready_to_switch') {
+    Log ('restart z UI: podmiana zakonczyla sie bledem (kod ' + $code + ') bez zmiany stanu - zostaje obecna wersja')
+    Write-UpdateState @{ state = 'failed'; targetVersion = $after.targetVersion; fromVersion = $after.fromVersion; pkg = $after.pkg;
+      branch = $after.branch; log = $LogFile; message = "Skrypt podmiany wersji zakonczyl sie bledem (kod $code). Nic nie zostalo podmienione." }
+    Start-Watchdog
+  }
+  exit $code
 }
 
 Log 'restart z UI: stary proces zakonczony - uruchamiam watchdoga'
