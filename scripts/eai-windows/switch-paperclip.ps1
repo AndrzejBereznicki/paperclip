@@ -25,7 +25,6 @@ function Fail-Hard([string]$msg, [string]$final = 'failed') {
   $state.state = $final; $state.message = $msg; Write-UpdateState $state
   Log ('switch: ' + $msg)
 }
-}
 
 if (!(Test-Path (Get-PkgEntry $newPkg))) { Fail-Hard "Brak przygotowanej wersji $newPkg - nic nie podmieniono."; exit 1 }
 
