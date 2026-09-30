@@ -63,6 +63,13 @@ describe("instance restart route", () => {
     expect(mockWriteHotRestartIntent).not.toHaveBeenCalled();
   });
 
+  it("does not shut down when the intent cannot be written", async () => {
+    mockWriteHotRestartIntent.mockRejectedValueOnce(new Error("disk full"));
+    const res = await request(createApp({ type: "board", source: "local_implicit" })).post("/api/instance/restart");
+    expect(res.status).toBe(500);
+    vi.runAllTimers();
+    expect(emitSpy).not.toHaveBeenCalledWith("SIGTERM", "SIGTERM");
+  });
   it("writes a hot-restart intent and shuts down through SIGTERM for instance admins", async () => {
     const app = createApp({ type: "board", source: "session", isInstanceAdmin: true });
     const res = await request(app).post("/api/instance/restart");
@@ -79,11 +86,4 @@ describe("instance restart route", () => {
     expect(second.status).toBe(409);
   });
 
-  it("does not shut down when the intent cannot be written", async () => {
-    mockWriteHotRestartIntent.mockRejectedValueOnce(new Error("disk full"));
-    const res = await request(createApp({ type: "board", source: "local_implicit" })).post("/api/instance/restart");
-    expect(res.status).toBe(500);
-    vi.runAllTimers();
-    expect(emitSpy).not.toHaveBeenCalledWith("SIGTERM", "SIGTERM");
-  });
 });

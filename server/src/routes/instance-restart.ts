@@ -21,77 +21,101 @@ const SHUTDOWN_DELAY_MS = 500;
  * before shutdown with PAPERCLIP_RESTART_PREVIOUS_PID so it can wait for this
  * process to exit and start the next one without waiting for a polling tick.
  */
+let restartPending = false;
+
+export type InstanceRestartResult =
+  | { ok: true; requestId: string; activeRunCount: number }
+  | { ok: false; error: "restart_already_requested" | "hot_restart_intent_failed" };
+
+export function isInstanceRestartPending() {
+  return restartPending;
+}
+
+/**
+ * Writes a hot-restart intent, spawns the respawn command and shuts this
+ * process down through the graceful SIGTERM path. Shared by the restart
+ * button and the update flow, which restarts into a freshly prepared build.
+ */
+export async function requestInstanceRestart(db: Db, reason: string): Promise<InstanceRestartResult> {
+  if (restartPending) return { ok: false, error: "restart_already_requested" };
+  restartPending = true;
+
+  const requestId = randomUUID();
+  const preflightActiveRunIds = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.status, "running"))
+    .then((rows) => rows.map((row) => row.id));
+  let intent: Awaited<ReturnType<typeof writeHotRestartIntent>>;
+  try {
+    intent = await writeHotRestartIntent({
+      previousServerPid: process.pid,
+      previousServerIdentity: getServerInfoSnapshot().processStartedAt,
+      previousServerVersion: serverVersion,
+      preflightActiveRunIds,
+      recoveryRequestId: requestId,
+    });
+  } catch (error) {
+    restartPending = false;
+    logger.error({ err: error, requestId }, "failed to write hot-restart intent for instance restart");
+    return { ok: false, error: "hot_restart_intent_failed" };
+  }
+
+  const respawnCommand = process.env.PAPERCLIP_RESTART_RESPAWN_COMMAND?.trim();
+  if (respawnCommand) {
+    try {
+      const child = spawn(respawnCommand, {
+        shell: true,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+        env: { ...process.env, PAPERCLIP_RESTART_PREVIOUS_PID: String(process.pid) },
+      });
+      child.on("error", (err) => logger.error({ err, requestId }, "restart respawn command failed"));
+      child.unref();
+    } catch (error) {
+      logger.error({ err: error, requestId }, "failed to spawn restart respawn command");
+    }
+  }
+
+  logger.warn(
+    { requestId, reason, activeRunIds: preflightActiveRunIds, respawnCommand: respawnCommand ?? null },
+    "instance restart requested; shutting down",
+  );
+
+  // process.kill(process.pid, "SIGTERM") hard-kills on Windows without
+  // running handlers, so emit the signal event to reuse the graceful path.
+  setTimeout(() => {
+    try {
+      process.emit("SIGTERM", "SIGTERM");
+    } catch (error) {
+      restartPending = false;
+      logger.error({ err: error, requestId }, "instance restart shutdown failed");
+      void removeHotRestartIntent(undefined, intent).catch(() => undefined);
+    }
+  }, SHUTDOWN_DELAY_MS);
+
+  return { ok: true, requestId, activeRunCount: preflightActiveRunIds.length };
+}
+
 export function instanceRestartRoutes(db: Db) {
   const router = Router();
-  let restartPending = false;
 
   router.post("/instance/restart", async (req, res) => {
     if (req.actor.type !== "board") throw forbidden("Board access required");
     if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
       throw forbidden("Instance admin access required");
     }
-    if (restartPending) {
-      res.status(409).json({ error: "restart_already_requested" });
+    const result = await requestInstanceRestart(db, "board_restart_button");
+    if (!result.ok) {
+      res.status(result.error === "restart_already_requested" ? 409 : 500).json({ error: result.error });
       return;
     }
-    restartPending = true;
-
-    const requestId = randomUUID();
-    const preflightActiveRunIds = await db
-      .select({ id: heartbeatRuns.id })
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.status, "running"))
-      .then((rows) => rows.map((row) => row.id));
-    let intent: Awaited<ReturnType<typeof writeHotRestartIntent>>;
-    try {
-      intent = await writeHotRestartIntent({
-        previousServerPid: process.pid,
-        previousServerIdentity: getServerInfoSnapshot().processStartedAt,
-        previousServerVersion: serverVersion,
-        preflightActiveRunIds,
-        recoveryRequestId: requestId,
-      });
-    } catch (error) {
-      restartPending = false;
-      logger.error({ err: error, requestId }, "failed to write hot-restart intent for instance restart");
-      res.status(500).json({ error: "hot_restart_intent_failed" });
-      return;
-    }
-
-    const respawnCommand = process.env.PAPERCLIP_RESTART_RESPAWN_COMMAND?.trim();
-    if (respawnCommand) {
-      try {
-        const child = spawn(respawnCommand, {
-          shell: true,
-          detached: true,
-          stdio: "ignore",
-          windowsHide: true,
-          env: { ...process.env, PAPERCLIP_RESTART_PREVIOUS_PID: String(process.pid) },
-        });
-        child.on("error", (err) => logger.error({ err, requestId }, "restart respawn command failed"));
-        child.unref();
-      } catch (error) {
-        logger.error({ err: error, requestId }, "failed to spawn restart respawn command");
-      }
-    }
-
-    logger.warn(
-      { requestId, activeRunIds: preflightActiveRunIds, respawnCommand: respawnCommand ?? null },
-      "instance restart requested by board; shutting down",
-    );
-    res.status(202).json({ status: "restart_requested", requestId, activeRunCount: preflightActiveRunIds.length });
-
-    // process.kill(process.pid, "SIGTERM") hard-kills on Windows without
-    // running handlers, so emit the signal event to reuse the graceful path.
-    setTimeout(() => {
-      try {
-        process.emit("SIGTERM", "SIGTERM");
-      } catch (error) {
-        restartPending = false;
-        logger.error({ err: error, requestId }, "instance restart shutdown failed");
-        void removeHotRestartIntent(undefined, intent).catch(() => undefined);
-      }
-    }, SHUTDOWN_DELAY_MS);
+    res.status(202).json({
+      status: "restart_requested",
+      requestId: result.requestId,
+      activeRunCount: result.activeRunCount,
+    });
   });
 
   return router;
