@@ -36,7 +36,7 @@ function Step([string]$text) {
 # Uruchamia narzedzie, dopisuje wyjscie do logu aktualizacji; kod != 0 -> wyjatek z czytelnym opisem.
 function Run([string]$what, [scriptblock]$cmd) {
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  & $cmd *>> $workLog
+  & $cmd 2>&1 | Out-File -Append -Encoding utf8 $workLog
   $code = $LASTEXITCODE
   $ErrorActionPreference = $eap
   if ($code -ne 0) { throw "$what (kod $code)" }
@@ -71,17 +71,18 @@ try {
   Run 'git checkout' { RepoGit checkout -f -B $newBranch $newTag }
   foreach ($c in $ours) {
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    RepoGit cherry-pick -x $c *>> $workLog
+    RepoGit cherry-pick -x $c 2>&1 | Out-File -Append -Encoding utf8 $workLog
     $code = $LASTEXITCODE; $ErrorActionPreference = $eap
     if ($code -ne 0) {
       $subject = RepoGit log -1 --format=%s $c
-      RepoGit cherry-pick --abort *>> $workLog
+      RepoGit cherry-pick --abort 2>&1 | Out-File -Append -Encoding utf8 $workLog
       throw ("konflikt przy przenoszeniu zmiany: " + $subject)
     }
   }
 
   Step 'Instaluje zaleznosci'
-  Run 'pnpm install' { & $pnpm[0] $pnpm[1] -C $repo install --frozen-lockfile --ignore-scripts }
+  # corepack wybiera wersje pnpm z packageManager w BIEZACYM katalogu - dlatego Push-Location, nie -C
+  Run 'pnpm install' { Push-Location $repo; try { & $pnpm[0] $pnpm[1] install --frozen-lockfile --ignore-scripts } finally { Pop-Location } }
 
   Step 'Testuje nasze zmiany'
   $tests = @($touched | Where-Object { $_ -match '\.test\.tsx?$' })
@@ -95,7 +96,7 @@ try {
   if ($Cfg.test.breakAt -eq 'build') {
     Add-Content -Path (Join-Path $repo 'ui\src\main.tsx') -Value 'const eks277SimulatedBrokenBuild: number = ;'
   }
-  Run 'build interfejsu' { & $pnpm[0] $pnpm[1] -C $repo --filter '@paperclipai/ui' build }
+  Run 'build interfejsu' { Push-Location $repo; try { & $pnpm[0] $pnpm[1] --filter '@paperclipai/ui' build } finally { Pop-Location } }
 
   Step 'Buduje zmiany serwera'
   $serverSrc = @($touched | Where-Object { $_ -match '^server/src/.*\.ts$' -and $_ -notmatch '(\.test\.ts|/__tests__/)' } |
@@ -143,7 +144,7 @@ try {
 
   if ($Cfg.pushBranch) {
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    RepoGit push -q origin $newBranch *>> $workLog
+    RepoGit push -q origin $newBranch 2>&1 | Out-File -Append -Encoding utf8 $workLog
     if ($LASTEXITCODE -ne 0) { Log "push $newBranch nie powiodl sie - galaz zostaje lokalnie" }
     $ErrorActionPreference = $eap
   }
