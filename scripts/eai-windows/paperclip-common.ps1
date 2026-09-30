@@ -115,10 +115,18 @@ function Wait-ServerUp([string]$pkg, [int]$timeoutSec) {
 function New-PaperclipIssue([string]$title, [string]$description) {
   if (-not $Cfg.issue) { return $null }
   $cli = Get-PkgEntry (Get-ActivePkg)
+  $cliArgs = @('issue', 'create', '--company-id', $Cfg.issue.companyId, '--status', 'todo', '--priority', 'high',
+    '--title', $title, '--description', $description, '--json')
+  if ($Cfg.issue.projectId) { $cliArgs += @('--project-id', $Cfg.issue.projectId) }
+  if ($Cfg.issue.assigneeAgentId) { $cliArgs += @('--assignee-agent-id', $Cfg.issue.assigneeAgentId) }
+  if ($Cfg.issue.apiBase) { $cliArgs += @('--api-base', $Cfg.issue.apiBase) }
+  if ($Cfg.issue.context) { $cliArgs += @('--context', $Cfg.issue.context) }
+  # Zadanie zaklada logowanie tej maszyny (board), nie token agenta odziedziczony przez srodowisko.
+  Remove-Item env:PAPERCLIP_API_KEY, env:PAPERCLIP_RUN_ID -ErrorAction SilentlyContinue
   try {
-    $out = & $NodeExe $cli issue create --company-id $Cfg.issue.companyId --project-id $Cfg.issue.projectId `
-      --assignee-agent-id $Cfg.issue.assigneeAgentId --status todo --priority high `
-      --title $title --description $description --json 2>&1
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $out = & $NodeExe $cli @cliArgs 2>$null
+    $ErrorActionPreference = $eap
     $obj = ($out | Out-String) | ConvertFrom-Json -ErrorAction Stop
     return $obj.identifier
   } catch {
