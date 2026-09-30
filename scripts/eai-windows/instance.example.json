@@ -1,0 +1,19 @@
+{
+  "nodeDir": "C:\\Users\\xfire\\AppData\\Local\\nvm\\v24.11.0",
+  "defaultPkg": "pkg-916",
+  "dataDir": null,
+  "dbDir": "C:\\Users\\xfire\\.paperclip\\instances\\default\\db",
+  "healthUrl": "http://127.0.0.1:3100/api/health",
+  "scheduledTask": "Paperclip",
+  "startTimeoutSec": 300,
+  "repo": "C:\\ekai\\upd",
+  "pushBranch": true,
+  "extraDependencies": { "paperclip-ollama-adapter": "^0.5.1" },
+  "issue": {
+    "companyId": "48dd5ec6-1ea3-44d9-8bb0-f1762912b8c9",
+    "projectId": "3f50996f-5650-4461-869a-7a03799c49ea",
+    "assigneeAgentId": "f751d89c-077c-4675-8974-2ee3b5e4b9a0"
+  },
+  "env": {},
+  "test": { "installVersion": null, "breakAt": null }
+}
