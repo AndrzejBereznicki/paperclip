@@ -50,6 +50,10 @@ if ((Test-Path $updLock) -and ((Get-Item $updLock).LastWriteTime -gt (Get-Date).
 }
 Set-Content -Path $updLock -Value "update $TargetVersion $stamp"
 $env:Path = "$($Cfg.nodeDir);$env:Path"
+# Zmienne odziedziczone po serwerze nie moga trafic do testow i buildu (test restartu odpalilby prawdziwy respawn).
+foreach ($v in 'PAPERCLIP_RESTART_RESPAWN_COMMAND', 'PAPERCLIP_UPDATE_COMMAND', 'PAPERCLIP_UPDATE_STATE_FILE', 'PAPERCLIP_UPDATE_SIMULATE_LATEST') {
+  Remove-Item "env:$v" -ErrorAction SilentlyContinue
+}
 $pnpm = @((Join-Path $Cfg.nodeDir 'corepack.cmd'), 'pnpm')
 
 try {
@@ -170,5 +174,8 @@ catch {
 finally {
   Remove-Item $updLock -Force -ErrorAction SilentlyContinue
   if ($overlay -and (Test-Path $overlay)) { Remove-Item -Recurse -Force $overlay -ErrorAction SilentlyContinue }
-  if ($Cfg.test.breakAt -eq 'build') { git -C $repo checkout -- ui/src/main.tsx 2>$null }
+  if ($Cfg.test.breakAt -eq 'build') {
+    $ErrorActionPreference = 'Continue'
+    RepoGit checkout -- ui/src/main.tsx 2>&1 | Out-File -Append -Encoding utf8 $workLog
+  }
 }
