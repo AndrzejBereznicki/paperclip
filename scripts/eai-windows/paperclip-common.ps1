@@ -53,11 +53,13 @@ function Get-ServerProcesses {
     Where-Object { $_.CommandLine -match 'paperclipai' -and $_.CommandLine -match '(^|\s)run(\s|$)' -and $_.CommandLine -match $rootRx }
 }
 
+# Procesy bazy TEJ instalacji. Tylko postmaster ma w linii polecen katalog bazy; procesy potomne
+# (checkpointer, backend...) maja tylko sciezke programu - ta lezy w pkg-* pod $Root.
 function Get-PostgresProcesses {
-  $db = [regex]::Escape(($Cfg.dbDir -replace '\\', '/'))
-  $dbWin = [regex]::Escape($Cfg.dbDir)
+  $rootFwd = [regex]::Escape($Root.Replace('\', '/'))
+  $rootWin = [regex]::Escape($Root)
   Get-CimInstance Win32_Process -Filter "Name = 'postgres.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match $db -or $_.CommandLine -match $dbWin }
+    Where-Object { $_.CommandLine -match $rootFwd -or $_.CommandLine -match $rootWin }
 }
 
 # Zatrzymuje serwer i jego baze. pg_ctl potrafi zglosic "No such process" (nieaktualny PID) -
