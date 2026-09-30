@@ -30,7 +30,7 @@ function Step([string]$text) {
   $state.step = $text
   Write-UpdateState $state
   Log ("aktualizacja " + $TargetVersion + ": " + $text)
-  Add-Content -Path $workLog -Encoding UTF8 -Value ("=== " + $text)
+  Add-Content -Path $workLog -Encoding UTF8 -Value ("=== " + $text) -ErrorAction SilentlyContinue
 }
 
 # Uruchamia narzedzie, dopisuje wyjscie do logu aktualizacji; kod != 0 -> wyjatek z czytelnym opisem.
@@ -155,7 +155,7 @@ try {
 catch {
   $msg = $_.Exception.Message
   Log ("aktualizacja " + $TargetVersion + " PRZERWANA: " + $msg)
-  Add-Content -Path $workLog -Encoding UTF8 -Value ("BLAD: " + $msg)
+  Add-Content -Path $workLog -Encoding UTF8 -Value ("BLAD: " + $msg) -ErrorAction SilentlyContinue
   $state.state = 'failed'
   $state.message = "Nieudany krok: $($state.step) - $msg. Nic nie zostalo podmienione."
   Write-UpdateState $state
