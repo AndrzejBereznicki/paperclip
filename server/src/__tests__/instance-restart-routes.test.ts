@@ -37,6 +37,7 @@ describe("instance restart route", () => {
   let emitSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    delete process.env.PAPERCLIP_RESTART_RESPAWN_COMMAND;
     vi.useFakeTimers({ toFake: ["setTimeout"] });
     mockWriteHotRestartIntent.mockReset().mockResolvedValue({ version: 1 });
     mockRemoveHotRestartIntent.mockReset().mockResolvedValue(undefined);
