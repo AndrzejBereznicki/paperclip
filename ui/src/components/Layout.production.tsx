@@ -34,6 +34,7 @@ import { ToastViewport } from "./ToastViewport";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
+import { InstanceUpdateBanner } from "./InstanceUpdateBanner";
 import { StandaloneBrowserControls } from "./StandaloneBrowserControls";
 import { RouteErrorBoundary } from "./RouteErrorBoundary";
 import { SidebarShell } from "./SidebarShell.production";
@@ -658,6 +659,7 @@ export function Layout() {
         </a>
         <WorktreeBanner />
         <DevRestartBanner devServer={health?.devServer} />
+        <InstanceUpdateBanner />
         <div
           className={cn(
             "min-h-0 flex-1",

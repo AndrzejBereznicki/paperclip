@@ -25,6 +25,7 @@ import { PluginAppShellOverlays } from "./PluginAppShellOverlays";
 import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
+import { InstanceUpdateBanner } from "./InstanceUpdateBanner";
 import { StandaloneBrowserControls } from "./StandaloneBrowserControls";
 import { RouteErrorBoundary } from "./RouteErrorBoundary";
 import { SidebarShell } from "./SidebarShell";
@@ -637,6 +638,7 @@ export function Layout({ sidebarSections }: { sidebarSections?: ReactNode }) {
       </a>
       <WorktreeBanner />
       <DevRestartBanner devServer={health?.devServer} />
+      <InstanceUpdateBanner />
       <div className={cn("min-h-0 flex-1", isMobile ? "w-full" : "flex overflow-clip")}>
         {isMobile && sidebarOpen && (
           <button
