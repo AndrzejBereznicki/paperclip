@@ -10,8 +10,12 @@ $StateFile = Join-Path $Root 'update-state.json'
 $MaintLock = Join-Path $Root 'maintenance.lock'
 $NodeExe   = Join-Path $Cfg.nodeDir 'node.exe'
 
+# Log nigdy nie przerywa pracy - plik moze byc chwilowo otwarty przez inny proces.
 function Log([string]$m) {
-  Add-Content -Path $LogFile -Encoding UTF8 -Value ("{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)
+  $line = "{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m
+  for ($i = 0; $i -lt 5; $i++) {
+    try { Add-Content -Path $LogFile -Encoding UTF8 -Value $line -ErrorAction Stop; return } catch { Start-Sleep -Milliseconds 300 }
+  }
 }
 
 function Get-ActivePkg {
@@ -43,7 +47,10 @@ function Write-UpdateState([hashtable]$s) {
   $json = $s | ConvertTo-Json -Depth 5
   $tmp = "$StateFile.tmp"
   [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
-  Move-Item -Force $tmp $StateFile
+  for ($i = 0; $i -lt 10; $i++) {
+    try { Move-Item -Force $tmp $StateFile -ErrorAction Stop; return } catch { Start-Sleep -Milliseconds 300 }
+  }
+  Log 'nie udalo sie zapisac update-state.json'
 }
 
 # Procesy serwera TEJ instalacji (po katalogu $Root w linii polecen), nie wszystkie node.exe.
