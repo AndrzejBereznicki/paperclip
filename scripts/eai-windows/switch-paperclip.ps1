@@ -19,14 +19,12 @@ $target  = $st.targetVersion
 $from    = (Get-PkgMeta $oldPkg).version
 $timeout = if ($Cfg.startTimeoutSec) { [int]$Cfg.startTimeoutSec } else { 300 }
 $dbBak   = "$($Cfg.dbDir).bak-update-$stamp"
-$state   = @{ state = 'switching'; targetVersion = $target; fromVersion = $from; pkg = $newPkg; previousPkg = $oldPkg; log = $st.log }
+$state   = @{ state = 'switching'; targetVersion = $target; fromVersion = $from; pkg = $newPkg; previousPkg = $oldPkg; branch = $st.branch; log = $LogFile }
 
 function Fail-Hard([string]$msg, [string]$final = 'failed') {
   $state.state = $final; $state.message = $msg; Write-UpdateState $state
   Log ('switch: ' + $msg)
-  $issue = New-PaperclipIssue "Aktualizacja Paperclip do $target nie wstala - wymaga recznej pracy" (
-    "$msg`n`n- Poprzedni pkg: $oldPkg`n- Nowy pkg: $newPkg`n- Kopia bazy sprzed podmiany: $dbBak`n- Log: $LogFile")
-  if ($issue) { $state.issue = $issue; Write-UpdateState $state }
+}
 }
 
 if (!(Test-Path (Get-PkgEntry $newPkg))) { Fail-Hard "Brak przygotowanej wersji $newPkg - nic nie podmieniono."; exit 1 }

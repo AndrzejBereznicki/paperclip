@@ -7,15 +7,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockSpawn = vi.hoisted(() => vi.fn());
 const mockRequestInstanceRestart = vi.hoisted(() => vi.fn());
+const mockIssueCreate = vi.hoisted(() => vi.fn());
 
 vi.mock("node:child_process", () => ({ spawn: mockSpawn }));
+vi.mock("../services/issues.js", () => ({
+  issueService: () => ({ create: mockIssueCreate }),
+}));
 vi.mock("../routes/instance-restart.js", () => ({
   requestInstanceRestart: mockRequestInstanceRestart,
   isInstanceRestartPending: () => false,
 }));
 
 const { errorHandler } = await import("../middleware/index.js");
-const { instanceUpdateRoutes, compareVersions, readUpdaterStatus } = await import("../routes/instance-update.js");
+const { instanceUpdateRoutes, compareVersions, readUpdaterStatus, fileUpdateFailureIssue } = await import(
+  "../routes/instance-update.js"
+);
 
 const admin = { type: "board", source: "session", isInstanceAdmin: true };
 
@@ -48,6 +54,7 @@ describe("instance update routes", () => {
     delete process.env.PAPERCLIP_UPDATE_SIMULATE_LATEST;
     mockSpawn.mockReset().mockReturnValue({ on: vi.fn(), unref: vi.fn() });
     mockRequestInstanceRestart.mockReset();
+    mockIssueCreate.mockReset();
   });
 
   afterEach(() => {
@@ -125,5 +132,33 @@ describe("instance update routes", () => {
 
     writeFileSync(stateFile, JSON.stringify({ state: "preparing", updatedAt: new Date(Date.now() - 3 * 3600_000).toISOString() }));
     expect(readUpdaterStatus(stateFile)?.state).toBe("failed");
+  });
+
+  it("files one task for a failed update when configured", async () => {
+    const failed = {
+      state: "rolled_back" as const,
+      targetVersion: "2026.1001.0",
+      fromVersion: "2026.916.1",
+      message: "nie wstała",
+      updatedAt: "2026-10-01T10:00:00.000Z",
+    };
+    delete process.env.PAPERCLIP_UPDATE_ISSUE_COMPANY_ID;
+    expect(await fileUpdateFailureIssue({} as any, failed)).toBeNull();
+    expect(mockIssueCreate).not.toHaveBeenCalled();
+
+    process.env.PAPERCLIP_UPDATE_ISSUE_COMPANY_ID = "company-1";
+    process.env.PAPERCLIP_UPDATE_ISSUE_ASSIGNEE_AGENT_ID = "agent-1";
+    mockIssueCreate.mockResolvedValueOnce({ id: "i1", identifier: "EKS-300" });
+    expect(await fileUpdateFailureIssue({} as any, failed)).toBe("EKS-300");
+    expect(mockIssueCreate).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        title: expect.stringContaining("nie wstała"),
+        assigneeAgentId: "agent-1",
+        idempotencyKey: "instance-update:2026.1001.0:rolled_back:2026-10-01T10:00:00.000Z",
+      }),
+    );
+    delete process.env.PAPERCLIP_UPDATE_ISSUE_COMPANY_ID;
+    delete process.env.PAPERCLIP_UPDATE_ISSUE_ASSIGNEE_AGENT_ID;
   });
 });
