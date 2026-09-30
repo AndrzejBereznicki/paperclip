@@ -42,7 +42,7 @@ function Run([string]$what, [scriptblock]$cmd) {
   if ($code -ne 0) { throw "$what (kod $code)" }
 }
 
-function Git { & git -C $repo @args }
+function RepoGit { & git.exe -C $repo -c user.name="EkspertAI Updater" -c user.email=dev-agent@ekspertai.local @args }
 
 if ((Test-Path $updLock) -and ((Get-Item $updLock).LastWriteTime -gt (Get-Date).AddMinutes(-90))) {
   Log 'aktualizacja juz trwa (update.lock) - pomijam'
@@ -57,25 +57,25 @@ try {
   if (-not $fromMeta) { throw "brak $fromPkg\eai-meta.json - nie wiem, ktore commity sa nasze" }
 
   Step 'Pobieram nowa wersje z GitHuba'
-  Run 'git fetch' { Git fetch upstream --tags --force }
+  Run 'git fetch' { RepoGit fetch upstream --tags --force }
   $newTag = "v$installVersion"
-  Run "brak tagu $newTag w upstream" { Git rev-parse --verify --quiet "refs/tags/$newTag" }
+  Run "brak tagu $newTag w upstream" { RepoGit rev-parse --verify --quiet "refs/tags/$newTag" }
 
-  $ours = @(Git rev-list --reverse "$($fromMeta.baseTag)..$($fromMeta.branch)")
+  $ours = @(RepoGit rev-list --reverse "$($fromMeta.baseTag)..$($fromMeta.branch)")
   if ($ours.Count -eq 0) { throw "brak naszych commitow w $($fromMeta.branch)" }
-  $touched = @(Git diff --name-only "$($fromMeta.baseTag)..$($fromMeta.branch)")
+  $touched = @(RepoGit diff --name-only "$($fromMeta.baseTag)..$($fromMeta.branch)")
   $outside = @($touched | Where-Object { $_ -notmatch '^(server/src|ui/src|scripts/eai-windows)/' })
   if ($outside.Count -gt 0) { throw ("nasze zmiany dotykaja plikow poza server/ui - automat ich nie przeniesie: " + ($outside -join ', ')) }
 
   Step ("Przenosze nasze zmiany (" + $ours.Count + " commitow)")
-  Run 'git checkout' { Git checkout -f -B $newBranch $newTag }
+  Run 'git checkout' { RepoGit checkout -f -B $newBranch $newTag }
   foreach ($c in $ours) {
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    Git cherry-pick -x $c *>> $workLog
+    RepoGit cherry-pick -x $c *>> $workLog
     $code = $LASTEXITCODE; $ErrorActionPreference = $eap
     if ($code -ne 0) {
-      $subject = Git log -1 --format=%s $c
-      Git cherry-pick --abort *>> $workLog
+      $subject = RepoGit log -1 --format=%s $c
+      RepoGit cherry-pick --abort *>> $workLog
       throw ("konflikt przy przenoszeniu zmiany: " + $subject)
     }
   }
@@ -143,7 +143,7 @@ try {
 
   if ($Cfg.pushBranch) {
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    Git push -q origin $newBranch *>> $workLog
+    RepoGit push -q origin $newBranch *>> $workLog
     if ($LASTEXITCODE -ne 0) { Log "push $newBranch nie powiodl sie - galaz zostaje lokalnie" }
     $ErrorActionPreference = $eap
   }
