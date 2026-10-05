@@ -99,6 +99,13 @@ export async function fileUpdateFailureIssue(db: Db, status: UpdaterStatus): Pro
   return issue.identifier ?? issue.id;
 }
 
+export function assertInstanceAdmin(req: Request) {
+  if (req.actor.type !== "board") throw forbidden("Board access required");
+  if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
+    throw forbidden("Instance admin access required");
+  }
+}
+
 type FetchLatest = () => Promise<string | null>;
 
 async function fetchLatestFromNpm(): Promise<string | null> {
@@ -156,12 +163,7 @@ export function instanceUpdateRoutes(
     return inflight;
   }
 
-  function assertAdmin(req: Request) {
-    if (req.actor.type !== "board") throw forbidden("Board access required");
-    if (req.actor.source !== "local_implicit" && !req.actor.isInstanceAdmin) {
-      throw forbidden("Instance admin access required");
-    }
-  }
+  const assertAdmin = assertInstanceAdmin;
 
   function snapshot() {
     return {

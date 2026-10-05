@@ -131,6 +131,7 @@ import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
 import { instanceRestartRoutes } from "./routes/instance-restart.js";
 import { instanceUpdateRoutes } from "./routes/instance-update.js";
+import { claudeCodeUpdateRoutes } from "./routes/claude-code-update.js";
 import { instanceSettingsService } from "./services/instance-settings.js";
 import { openApiRoutes } from "./routes/openapi.js";
 import {
@@ -890,6 +891,7 @@ export async function createApp(
   api.use(instanceSettingsRoutes(db, workerManager, opts.prepareIdleDatabaseBackup));
   api.use(instanceRestartRoutes(db));
   api.use(instanceUpdateRoutes(db));
+  api.use(claudeCodeUpdateRoutes());
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }
