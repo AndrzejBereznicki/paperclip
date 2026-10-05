@@ -26,6 +26,7 @@ import { MobileBottomNav } from "./MobileBottomNav";
 import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
 import { InstanceUpdateBanner } from "./InstanceUpdateBanner";
+import { ClaudeCodeUpdateBanner } from "./ClaudeCodeUpdateBanner";
 import { StandaloneBrowserControls } from "./StandaloneBrowserControls";
 import { RouteErrorBoundary } from "./RouteErrorBoundary";
 import { SidebarShell } from "./SidebarShell";
@@ -639,6 +640,7 @@ export function Layout({ sidebarSections }: { sidebarSections?: ReactNode }) {
       <WorktreeBanner />
       <DevRestartBanner devServer={health?.devServer} />
       <InstanceUpdateBanner />
+      <ClaudeCodeUpdateBanner />
       <div className={cn("min-h-0 flex-1", isMobile ? "w-full" : "flex overflow-clip")}>
         {isMobile && sidebarOpen && (
           <button
