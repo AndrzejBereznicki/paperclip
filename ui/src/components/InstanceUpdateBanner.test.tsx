@@ -68,7 +68,7 @@ describe("InstanceUpdateBanner", () => {
   it("offers the new version and starts the update only after confirmation", async () => {
     mockApi.get.mockResolvedValue(status());
     const el = await render();
-    expect(el.textContent).toContain("Dostępna nowa wersja 2026.1001.0");
+    expect(el.textContent).toContain("Dostępna nowa wersja Paperclip: 2026.1001.0");
     expect(mockApi.post).not.toHaveBeenCalled();
 
     const button = [...el.querySelectorAll("button")].find((b) => b.textContent?.includes("Zaktualizuj"))!;
@@ -105,7 +105,7 @@ describe("InstanceUpdateBanner", () => {
       status({ updater: { state: "preparing", targetVersion: "2026.1001.0", step: "Buduję interfejs" } }),
     );
     const el = await render();
-    expect(el.textContent).toContain("Aktualizacja do 2026.1001.0: Buduję interfejs");
+    expect(el.textContent).toContain("Aktualizacja Paperclip do 2026.1001.0: Buduję interfejs");
     expect(el.textContent).not.toContain("Zaktualizuj");
   });
 
