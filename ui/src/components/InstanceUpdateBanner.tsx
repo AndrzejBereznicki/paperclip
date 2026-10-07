@@ -110,12 +110,12 @@ export function InstanceUpdateBanner() {
     icon = <Loader2 className="h-4 w-4 shrink-0 animate-spin" />;
     text =
       updater.state === "preparing"
-        ? `Aktualizacja do ${updater.targetVersion}: ${updater.step ?? "przygotowuję"}…`
-        : `Przełączam na ${updater.targetVersion} — serwer wróci za ok. 1–2 min, strona odświeży się sama.`;
+        ? `Aktualizacja Paperclip do ${updater.targetVersion}: ${updater.step ?? "przygotowuję"}…`
+        : `Przełączam Paperclip na ${updater.targetVersion} — serwer wróci za ok. 1–2 min, strona odświeży się sama.`;
   } else if (updater && (updater.state === "failed" || updater.state === "rolled_back") && dismissed !== dismissToken) {
     tone = "error";
     icon = <AlertTriangle className="h-4 w-4 shrink-0" />;
-    text = `Aktualizacja do ${updater.targetVersion} wymaga ręcznej pracy. ${updater.message ?? ""}${
+    text = `Aktualizacja Paperclip do ${updater.targetVersion} wymaga ręcznej pracy. ${updater.message ?? ""}${
       updater.issue ? ` Zadanie: ${updater.issue}.` : ""
     } Działa dotychczasowa wersja ${data.currentVersion}.`;
     dismissible = true;
@@ -127,11 +127,11 @@ export function InstanceUpdateBanner() {
   ) {
     tone = "ok";
     icon = <CheckCircle2 className="h-4 w-4 shrink-0" />;
-    text = `Zaktualizowano do ${data.currentVersion}.`;
+    text = `Zaktualizowano Paperclip do ${data.currentVersion}.`;
     dismissible = true;
   } else if (data.updateAvailable && data.latestVersion) {
     tone = "warn";
-    text = `Dostępna nowa wersja ${data.latestVersion} (masz ${data.currentVersion}).`;
+    text = `Dostępna nowa wersja Paperclip: ${data.latestVersion} (masz ${data.currentVersion}).`;
     action = updateButton("Zaktualizuj");
   } else {
     return null;
