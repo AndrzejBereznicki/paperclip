@@ -27,7 +27,7 @@ interface Deps {
   runUpdate: (onOutput: (chunk: string) => void) => Promise<number>;
 }
 
-function claudeBin() {
+export function claudeBin() {
   return process.env.PAPERCLIP_CLAUDE_BIN?.trim() || path.join(os.homedir(), ".local", "bin", "claude.exe");
 }
 
