@@ -165,4 +165,13 @@ describe("claude login routes", () => {
     expect((await request(app).get(`/api/instance/claude-login/${loginId}`)).body.state).toBe("timeout");
     expect(fake.kill).toHaveBeenCalled();
   });
+  it("simulates logged out until refresh", async () => {
+    const fake = fakeLogin();
+    fake.state.loggedIn = true;
+    const app = createApp(admin, fake);
+    expect((await request(app).get("/api/instance/claude-login-status?simulateLoggedOut=1")).body.loggedIn).toBe(false);
+    expect((await request(app).get("/api/instance/claude-login-status")).body.loggedIn).toBe(false);
+    expect((await request(app).post("/api/instance/claude-login/start")).body.error).toBe("already_logged_in");
+    expect((await request(app).get("/api/instance/claude-login-status?refresh=1")).body.loggedIn).toBe(true);
+  });
 });
