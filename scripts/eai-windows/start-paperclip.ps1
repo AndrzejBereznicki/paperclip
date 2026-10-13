@@ -25,11 +25,13 @@ try {
 # 1b. Trwa przelaczanie/wycofanie wersji -> nie startuj. Lock starszy niz 30 min ignorujemy.
 if ((Test-Path $MaintLock) -and ((Get-Item $MaintLock).LastWriteTime -gt (Get-Date).AddMinutes(-30))) { Log 'maintenance.lock - pomijam start'; exit 0 }
 
+# 1c. EKS-452: aktywna wersja musi byc jednoznacznie znana zanim cokolwiek ja uzyje ponizej.
+try { $pkg = Get-ActivePkg } catch { Log ("BLAD: " + $_.Exception.Message); exit 1 }
+
 # 2. Nie odpowiada, ale proces "paperclipai ... run" juz wstaje -> daj mu czas, nie startuj drugiego.
 if (Get-ServerProcesses) { Log 'health NIE ok, ale proces run juz istnieje - czekam na kolejny tick'; exit 0 }
 
 # 3. Sanity: aktywna instalacja musi istniec.
-$pkg = Get-ActivePkg
 $entry = Get-PkgEntry $pkg
 if (!(Test-Path $entry)) { Log ("BLAD: brak instalacji " + $entry); exit 1 }
 

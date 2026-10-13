@@ -18,10 +18,12 @@ function Log([string]$m) {
   }
 }
 
+# EKS-452: zadnego cichego powrotu do defaultPkg - jesli ten plik jest pusty/uszkodzony, watchdog
+# moglby po cichu wystartowac przestarzala, ale wciaz zainstalowana wersje. Blad ma byc glosny.
 function Get-ActivePkg {
   $f = Join-Path $Root 'active-pkg.txt'
-  if (Test-Path $f) { $n = (Get-Content -Raw $f).Trim(); if ($n) { return $n } }
-  return $Cfg.defaultPkg
+  if (Test-Path $f) { $n = Get-Content -Raw $f; if ($n -and $n.Trim()) { return $n.Trim() } }
+  throw "active-pkg.txt brakuje lub jest puste ($f) - nie wiadomo, ktora wersja Paperclipa ma byc aktywna. Odtworz plik recznie (nazwa katalogu pkg-*, np. z update-state.json) i uruchom ponownie."
 }
 
 function Set-ActivePkg([string]$name) {
