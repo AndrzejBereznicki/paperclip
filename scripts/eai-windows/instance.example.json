@@ -1,6 +1,5 @@
 {
   "nodeDir": "C:\\Users\\xfire\\AppData\\Local\\nvm\\v24.11.0",
-  "defaultPkg": "pkg-916",
   "dataDir": null,
   "dbDir": "C:\\Users\\xfire\\.paperclip\\instances\\default\\db",
   "healthUrl": "http://127.0.0.1:3100/api/health",
