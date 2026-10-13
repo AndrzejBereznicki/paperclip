@@ -175,6 +175,10 @@ vi.mock("./ClaudeCodeUpdateBanner", () => ({
   ClaudeCodeUpdateBanner: () => null,
 }));
 
+vi.mock("./ClaudeLoginBanner", () => ({
+  ClaudeLoginBanner: () => null,
+}));
+
 vi.mock("./InstanceUpdateBanner", () => ({
   InstanceUpdateBanner: () => null,
 }));

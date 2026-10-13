@@ -112,6 +112,7 @@ export function claudeLoginRoutes(opts: Partial<Deps> = {}) {
   let nextCheckAt = 0;
   let inflight: Promise<void> | null = null;
   let run: LoginRun | null = null;
+  let simulatedLoggedOut = false;
 
   function check(force = false): Promise<void> {
     if (force) nextCheckAt = 0;
@@ -156,10 +157,16 @@ export function claudeLoginRoutes(opts: Partial<Deps> = {}) {
     };
   }
 
+  /**
+   * `?simulateLoggedOut=1` reports logged out (banner demo) until `?refresh=1`;
+   * starting a login still sees the real status and answers `already_logged_in`.
+   */
   router.get("/instance/claude-login-status", async (req, res) => {
     assertInstanceAdmin(req);
+    if (req.query.simulateLoggedOut === "1") simulatedLoggedOut = true;
+    if (req.query.refresh === "1") simulatedLoggedOut = false;
     await check(req.query.refresh === "1");
-    res.json(status);
+    res.json(simulatedLoggedOut && status ? { ...status, loggedIn: false } : status);
   });
 
   router.post("/instance/claude-login/start", async (req, res) => {
