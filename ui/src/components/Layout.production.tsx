@@ -36,6 +36,7 @@ import { WorktreeBanner } from "./WorktreeBanner";
 import { DevRestartBanner } from "./DevRestartBanner";
 import { InstanceUpdateBanner } from "./InstanceUpdateBanner";
 import { ClaudeCodeUpdateBanner } from "./ClaudeCodeUpdateBanner";
+import { ClaudeLoginBanner } from "./ClaudeLoginBanner";
 import { StandaloneBrowserControls } from "./StandaloneBrowserControls";
 import { RouteErrorBoundary } from "./RouteErrorBoundary";
 import { SidebarShell } from "./SidebarShell.production";
@@ -654,6 +655,7 @@ export function Layout() {
         <WorktreeBanner />
         <DevRestartBanner devServer={health?.devServer} />
         <InstanceUpdateBanner />
+        <ClaudeLoginBanner />
         <ClaudeCodeUpdateBanner />
         <div
           className={cn(
