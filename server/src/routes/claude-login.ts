@@ -6,7 +6,9 @@ import { logger } from "../middleware/logger.js";
 import { claudeBin } from "./claude-code-update.js";
 import { assertInstanceAdmin } from "./instance-update.js";
 
-const STATUS_INTERVAL_MS = 5 * 60_000;
+// Short on purpose: a logged-out CLI stops every agent, so the banner should
+// show within a couple of minutes. `claude auth status` only reads local files.
+const STATUS_INTERVAL_MS = 60_000;
 const STATUS_TIMEOUT_MS = 15_000;
 const PROMPT_TIMEOUT_MS = 30_000;
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
