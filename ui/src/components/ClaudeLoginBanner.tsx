@@ -51,7 +51,7 @@ export function ClaudeLoginBanner() {
     queryKey: STATUS_KEY,
     queryFn: () => api.get<ClaudeLoginStatus>("/instance/claude-login-status"),
     retry: false,
-    refetchInterval: 5 * 60_000,
+    refetchInterval: 60_000,
   });
 
   const { data: run } = useQuery({
