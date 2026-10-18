@@ -875,6 +875,34 @@ describe.sequential("plugin tool and bridge authz", () => {
     });
   });
 
+  it("scopes agent plugin actions to the agent's own company when companyId is omitted", async () => {
+    readyPlugin();
+    const call = vi.fn().mockResolvedValue({ ok: true });
+    const { app } = await createApp(agentActor(), {}, {
+      bridgeDeps: {
+        workerManager: { call },
+      },
+    });
+
+    const res = await request(app)
+      .post(`/api/plugins/${pluginId}/actions/sync`)
+      .send({ params: { foo: "bar" } });
+
+    expect(res.status).toBe(200);
+    expect(call).toHaveBeenCalledWith(pluginId, "performAction", {
+      key: "sync",
+      params: { foo: "bar", companyId: companyA },
+      actorContext: {
+        type: "agent",
+        userId: null,
+        agentId: agentA,
+        runId: runA,
+        companyId: companyA,
+      },
+      renderEnvironment: null,
+    });
+  });
+
   it("rejects agent plugin actions outside the authenticated company scope", async () => {
     readyPlugin();
     const call = vi.fn().mockResolvedValue({ ok: true });
