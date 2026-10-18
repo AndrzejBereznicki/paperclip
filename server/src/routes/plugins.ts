@@ -727,6 +727,9 @@ export function pluginRoutes(
 
   function assertPluginBridgeScope(req: Request, companyId: unknown): string | undefined {
     if (companyId === undefined || companyId === null) {
+      if (req.actor.type === "agent" && req.actor.companyId) {
+        return req.actor.companyId;
+      }
       assertInstanceAdmin(req);
       return undefined;
     }
