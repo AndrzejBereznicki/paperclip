@@ -5,6 +5,7 @@ import {
   crossIssueInfluenceLimitError,
   evaluateCrossIssueInfluenceLimit,
   observeCrossIssueInfluence,
+  pinRunSourceIssueIfUnset,
 } from "../services/cross-issue-influence-limit.ts";
 
 function counterDb(
@@ -212,5 +213,88 @@ describe("cross-issue influence limit rollout", () => {
       details: { code: "cross_issue_influence_run_context_required" },
     });
     expect(fake.inserted).toEqual([]);
+  });
+});
+
+/**
+ * EKS-559: a run dispatched without a source issue (generic/idle wake) that
+ * self-picks and checks out a task never gets one recorded on its own
+ * context, so its own next comment/update is rejected as cross-issue.
+ * `pinRunSourceIssueIfUnset` is the checkout-time fix for that gap.
+ */
+function pinDb(runRow: Record<string, unknown> | null) {
+  const updates: Array<Record<string, unknown>> = [];
+  const tx = {
+    select: () => ({
+      from: () => ({
+        where: () => ({
+          for: () => ({
+            then: (resolve: (rows: unknown[]) => unknown) => resolve(runRow === null ? [] : [runRow]),
+          }),
+        }),
+      }),
+    }),
+    update: () => ({
+      set: (value: Record<string, unknown>) => ({
+        where: async () => {
+          updates.push(value);
+        },
+      }),
+    }),
+  };
+  return {
+    db: {
+      transaction: async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx),
+    },
+    updates,
+  };
+}
+
+describe("pinRunSourceIssueIfUnset", () => {
+  const base = {
+    companyId: "22222222-2222-4222-8222-222222222222",
+    runId: "11111111-1111-4111-8111-111111111111",
+    agentId: "33333333-3333-4333-8333-333333333333",
+    issueId: "55555555-5555-4555-8555-555555555555",
+  };
+
+  it("pins the checked-out issue when the run has no source issue yet", async () => {
+    const fake = pinDb({ contextSnapshot: null });
+
+    await pinRunSourceIssueIfUnset(fake.db as never, base);
+
+    expect(fake.updates).toEqual([{ contextSnapshot: { issueId: base.issueId } }]);
+  });
+
+  it("merges into an existing contextSnapshot without dropping other keys", async () => {
+    const fake = pinDb({ contextSnapshot: { source: "idle" } });
+
+    await pinRunSourceIssueIfUnset(fake.db as never, base);
+
+    expect(fake.updates).toEqual([{ contextSnapshot: { source: "idle", issueId: base.issueId } }]);
+  });
+
+  it("never overwrites an already-pinned source issue", async () => {
+    const fake = pinDb({ contextSnapshot: { issueId: "99999999-9999-4999-8999-999999999999" } });
+
+    await pinRunSourceIssueIfUnset(fake.db as never, base);
+
+    expect(fake.updates).toEqual([]);
+  });
+
+  it("no-ops for an unknown run", async () => {
+    const fake = pinDb(null);
+
+    await pinRunSourceIssueIfUnset(fake.db as never, base);
+
+    expect(fake.updates).toEqual([]);
+  });
+
+  it("fails closed before querying for a malformed run id", async () => {
+    const fake = pinDb({ contextSnapshot: null });
+
+    await pinRunSourceIssueIfUnset(fake.db as never, { ...base, runId: "attacker-controlled-run-id" });
+
+    expect(fake.updates).toEqual([]);
   });
 });
