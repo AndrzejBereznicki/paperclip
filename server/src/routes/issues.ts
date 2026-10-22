@@ -341,6 +341,7 @@ import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
   observeCrossIssueInfluence,
+  pinRunSourceIssueIfUnset,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
 import {
@@ -15142,6 +15143,25 @@ export function issueRoutes(
         await companySkillsSvc.markTestRunRunning(
           updated.companyId,
           updated.id,
+        );
+      }
+
+      // EKS-559: a run dispatched without a source issue (generic/idle wake)
+      // that self-picks and checks out a task here never gets one recorded on
+      // its own context, so its own next comment/update looks cross-issue and
+      // is rejected. Pin this issue as the run's source now that checkout —
+      // the only other place that could — has succeeded.
+      if (req.actor.type === "agent" && req.actor.agentId && checkoutRunId) {
+        await pinRunSourceIssueIfUnset(db, {
+          companyId: issue.companyId,
+          runId: checkoutRunId,
+          agentId: req.actor.agentId,
+          issueId: issue.id,
+        }).catch((err) =>
+          logger.warn(
+            { err, issueId: issue.id, runId: checkoutRunId },
+            "failed to pin run source issue after checkout",
+          ),
         );
       }
 
