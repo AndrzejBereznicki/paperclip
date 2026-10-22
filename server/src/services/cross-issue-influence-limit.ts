@@ -178,6 +178,49 @@ export async function observeCrossIssueInfluence(
   });
 }
 
+/**
+ * Pin a run's source issue when it was dispatched without one — e.g. a
+ * generic/idle wake (no `PAPERCLIP_TASK_ID`) that self-picked a task from
+ * `/agents/me/inbox-lite` and checked it out mid-run (EKS-559). Checkout never
+ * goes through {@link observeCrossIssueInfluence}, so without this pin the
+ * run's own just-checked-out issue has no recorded source issue id and the
+ * very next comment/update on it is rejected by
+ * {@link crossIssueInfluenceRunContextError} as if it targeted a foreign
+ * issue. Never overwrites an existing source issue id — a run dispatched for
+ * one issue stays scoped to it even if it later checks out another.
+ */
+export async function pinRunSourceIssueIfUnset(
+  db: Db,
+  input: { companyId: string; runId: string; agentId: string; issueId: string },
+): Promise<void> {
+  if (!isUuidLike(input.runId)) return;
+  await db.transaction(async (tx) => {
+    const [run] = await tx
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      ))
+      .for("update");
+    if (!run) return;
+    if (readRunSourceIssueId(run.contextSnapshot)) return;
+    const base =
+      run.contextSnapshot && typeof run.contextSnapshot === "object" && !Array.isArray(run.contextSnapshot)
+        ? (run.contextSnapshot as Record<string, unknown>)
+        : {};
+    await tx
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { ...base, issueId: input.issueId } })
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      ));
+  });
+}
+
 export function crossIssueInfluenceLimitError(
   decision: CrossIssueInfluenceDecision,
   context: { actorLabel?: string | null; assigneeLabel?: string | null; issueIdentifier?: string | null } = {},
