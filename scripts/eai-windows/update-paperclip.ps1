@@ -203,6 +203,15 @@ try {
   }
   Rename-Item (Join-Path $serverPkg 'ui-dist') 'ui-dist.upstream'
   Copy-Item -Recurse (Join-Path $repo 'ui\dist') (Join-Path $serverPkg 'ui-dist')
+  # EKS-577: reczne latki nakladane automatycznie (wczesniej tylko sprawdzane -> aktualizacja stawala)
+  # EKS-308: PWA na telefonie bez paska przegladarki
+  $manifest = Join-Path $serverPkg 'ui-dist\site.webmanifest'
+  $mf = [System.IO.File]::ReadAllText($manifest) -replace '"display"\s*:\s*"browser"', '"display": "standalone"'
+  [System.IO.File]::WriteAllText($manifest, $mf, (New-Object System.Text.UTF8Encoding($false)))
+  # EKS-474: git bez windowsHide = migajace czarne okienka przy kazdym heartbeacie
+  $entry = Get-PkgEntry $newPkg
+  Run 'latka windowsHide' { & $NodeExe (Join-Path $Root 'patch-windows-hide.mjs') $entry }
+  Run 'index.js po latce windowsHide nie parsuje sie' { & $NodeExe --check $entry }
 
   Step 'Sprawdzam, czy nowa wersja sie laduje'
   $imports = @('dist/app.js') + ($serverSrc | ForEach-Object { 'dist/' + ($_ -replace '^server/src/', '' -replace '\.ts$', '.js') })
@@ -215,7 +224,7 @@ try {
   Step 'Weryfikuje reczne latki'
   # EKS-451: npm install i nadpisanie ui-dist (krok wyzej) moga ubic reczne latki bez sladu -
   # blad tutaj, nie ostrzezenie, zeby aktualizacja nie przeszla cicho bez nich.
-  Run 'reczne latki (npm->cmd.exe w adapters.js / manifest standalone) nie przetrwaly aktualizacji' {
+  Run 'reczne latki (npm->cmd.exe w adapters.js / manifest standalone / windowsHide) nie przetrwaly aktualizacji' {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'verify-manual-patches.ps1') -ServerPkgPath $serverPkg
   }
 
