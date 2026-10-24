@@ -26,8 +26,32 @@ $newBranch = if ($Cfg.test.installVersion) { "eai-test-$stamp" } else { "eai-$Ta
 $workLog = Join-Path $Root "update-$stamp.log"
 $state = @{ state = 'preparing'; targetVersion = $TargetVersion; fromVersion = $fromMeta.version; pkg = $newPkg; branch = $newBranch; log = $workLog }
 
+# EKS-327: baner pokazuje numer kroku, % i szacowany czas (pomiar z 2026-09-30: cala aktualizacja ~9 min).
+$Steps = @(
+  @{ name = 'Pobieram nowa wersje z GitHuba'; min = 0.5 },
+  @{ name = 'Przenosze nasze zmiany';         min = 0.2 },
+  @{ name = 'Instaluje zaleznosci';           min = 2 },
+  @{ name = 'Testuje nasze zmiany';           min = 1 },
+  @{ name = 'Buduje interfejs';               min = 3 },
+  @{ name = 'Buduje zmiany serwera';          min = 0.2 },
+  @{ name = 'Instaluje paperclipai';          min = 2 },
+  @{ name = 'Nakladam nasze zmiany';          min = 0.2 },
+  @{ name = 'Sprawdzam, czy nowa wersja';     min = 0.2 },
+  @{ name = 'Weryfikuje reczne latki';        min = 0.1 },
+  @{ name = 'Gotowe';                         min = 0 }
+)
+$started = Get-Date
+
 function Step([string]$text) {
-  $state.step = $text
+  $i = 0; while ($i -lt $Steps.Count - 1 -and -not $text.StartsWith($Steps[$i].name)) { $i++ }
+  $done = 0; $total = 0
+  for ($j = 0; $j -lt $Steps.Count; $j++) { $total += $Steps[$j].min; if ($j -lt $i) { $done += $Steps[$j].min } }
+  $pct = [int](100 * $done / $total)
+  $left = [math]::Ceiling($total - $done)
+  $elapsed = [int]((Get-Date) - $started).TotalMinutes
+  $eta = if ($left -gt 0) { ", zostalo ok. $left min" } else { '' }
+  $state.step = "Krok $($i + 1)/$($Steps.Count) ($pct%): $text - trwa $elapsed min$eta"
+  $state.percent = $pct
   Write-UpdateState $state
   Log ("aktualizacja " + $TargetVersion + ": " + $text)
   Add-Content -Path $workLog -Encoding UTF8 -Value ("=== " + $text) -ErrorAction SilentlyContinue
@@ -61,7 +85,8 @@ try {
   if (-not $fromMeta) { throw "brak $fromPkg\eai-meta.json - nie wiem, ktore commity sa nasze" }
 
   Step 'Pobieram nowa wersje z GitHuba'
-  Run 'git fetch' { RepoGit fetch upstream --tags --force }
+  # EKS-444: fetch zawisl na 90 min bez bledu - przy zastoju sieci (<1 KB/s przez 60 s) ma sie przerwac
+  Run 'git fetch' { RepoGit -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 -c credential.interactive=never fetch upstream --tags --force }
   $newTag = "v$installVersion"
   Run "brak tagu $newTag w upstream" { RepoGit rev-parse --verify --quiet "refs/tags/$newTag" }
 
@@ -72,7 +97,27 @@ try {
   if ($outside.Count -gt 0) { throw ("nasze zmiany dotykaja plikow poza server/ui - automat ich nie przeniesie: " + ($outside -join ', ')) }
 
   Step ("Przenosze nasze zmiany (" + $ours.Count + " commitow)")
-  Run 'git checkout' { RepoGit checkout -f -B $newBranch $newTag }
+  # EKS-575: po konflikcie czlowiek/agent przenosi zmiany recznie na $newBranch. Jesli galaz stoi na
+  # nowym tagu i ma wszystkie nasze commity (po tytule), uzyj jej zamiast cherry-pick od zera.
+  # Polowiczna galaz po nieudanej probie nie przejdzie tego sprawdzenia i zostanie zbudowana od nowa.
+  $prepared = $false
+  RepoGit rev-parse --verify --quiet "refs/heads/$newBranch" | Out-Null
+  if ($LASTEXITCODE -eq 0) {
+    RepoGit merge-base --is-ancestor $newTag $newBranch
+    if ($LASTEXITCODE -eq 0) {
+      $have = @(RepoGit log --format=%s "$newTag..$newBranch")
+      $missing = @($ours | Where-Object { $have -notcontains (RepoGit log -1 --format=%s $_) })
+      $prepared = $missing.Count -eq 0
+    }
+  }
+  if ($prepared) {
+    Add-Content -Path $workLog -Encoding UTF8 -Value "=== uzywam przygotowanej galezi $newBranch"
+    Run 'git checkout' { RepoGit checkout -f $newBranch }
+    $ours = @()
+    $touched = @(RepoGit diff --name-only "$newTag..$newBranch")
+  } else {
+    Run 'git checkout' { RepoGit checkout -f -B $newBranch $newTag }
+  }
   foreach ($c in $ours) {
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     RepoGit cherry-pick -x $c 2>&1 | Out-File -Append -Encoding utf8 $workLog
@@ -86,7 +131,16 @@ try {
 
   Step 'Instaluje zaleznosci'
   # corepack wybiera wersje pnpm z packageManager w BIEZACYM katalogu - dlatego Push-Location, nie -C
-  Run 'pnpm install' { Push-Location $repo; try { & $pnpm[0] $pnpm[1] install --frozen-lockfile --ignore-scripts } finally { Pop-Location } }
+  # EKS-327: bez okna pnpm nie moze pytac "usunac node_modules? (Y/n)" - inaczej wisi w nieskonczonosc
+  $env:CI = 'true'
+  # EKS-444: upstream potrafi wydac tag z nieaktualnym pnpm-lock.yaml (2026.1012.0) - wtedy instalacja bez frozen.
+  # Repo sluzy tylko do budowy UI i nakladki; serwer i tak pochodzi z npm.
+  try {
+    Run 'pnpm install' { Push-Location $repo; try { & $pnpm[0] $pnpm[1] install --frozen-lockfile --ignore-scripts --config.confirm-modules-purge=false } finally { Pop-Location } }
+  } catch {
+    Add-Content -Path $workLog -Encoding UTF8 -Value '=== pnpm-lock.yaml niezgodny - ponawiam bez --frozen-lockfile'
+    Run 'pnpm install' { Push-Location $repo; try { & $pnpm[0] $pnpm[1] install --no-frozen-lockfile --ignore-scripts --config.confirm-modules-purge=false } finally { Pop-Location } }
+  }
 
   Step 'Testuje nasze zmiany'
   $tests = @($touched | Where-Object { $_ -match '\.test\.tsx?$' })
@@ -137,6 +191,13 @@ try {
     }) -join ' '
   Run 'nowa wersja serwera nie laduje sie' { & $NodeExe --input-type=module -e "$js console.log('import ok'); process.exit(0);" }
   if (!(Test-Path (Join-Path $serverPkg 'ui-dist\index.html'))) { throw 'brak ui-dist\index.html' }
+
+  Step 'Weryfikuje reczne latki'
+  # EKS-451: npm install i nadpisanie ui-dist (krok wyzej) moga ubic reczne latki bez sladu -
+  # blad tutaj, nie ostrzezenie, zeby aktualizacja nie przeszla cicho bez nich.
+  Run 'reczne latki (npm->cmd.exe w adapters.js / manifest standalone) nie przetrwaly aktualizacji' {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'verify-manual-patches.ps1') -ServerPkgPath $serverPkg
+  }
 
   if ($Cfg.test.breakAt -eq 'startup') {
     # Symulacja buildu, ktory przechodzi testy, ale serwer nie wstaje -> sprawdza automatyczne wycofanie.
