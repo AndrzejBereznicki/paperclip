@@ -66,6 +66,22 @@ function Run([string]$what, [scriptblock]$cmd) {
   if ($code -ne 0) { throw "$what (kod $code)" }
 }
 
+# EKS-576: pnpm install zawisl na pobieraniu ostatnich paczek (zastoj sieci) i stal 90 min bez bledu.
+# Twardy limit czasu: po $minutes min zabija drzewo procesow i rzuca wyjatek (wywolujacy moze ponowic).
+function RunTimed([string]$what, [int]$minutes, [string]$dir, [string[]]$argv) {
+  $out = "$workLog.part"
+  $p = Start-Process -FilePath $argv[0] -ArgumentList $argv[1..($argv.Count - 1)] -WorkingDirectory $dir `
+    -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+  $null = $p.Handle  # bez tego ExitCode po zakonczeniu jest pusty (Start-Process -PassThru)
+  $finished = $p.WaitForExit($minutes * 60000)
+  if (-not $finished) { & taskkill.exe /T /F /PID $p.Id 2>&1 | Out-Null; $p.WaitForExit(30000) | Out-Null }
+  foreach ($f in $out, "$out.err") {
+    if (Test-Path $f) { Get-Content $f | Out-File -Append -Encoding utf8 $workLog; Remove-Item $f -ErrorAction SilentlyContinue }
+  }
+  if (-not $finished) { throw "$what - brak konca po $minutes min (przerwane)" }
+  if ($p.ExitCode -ne 0) { throw "$what (kod $($p.ExitCode))" }
+}
+
 function RepoGit { & git.exe -C $repo -c user.name="EkspertAI Updater" -c user.email=dev-agent@ekspertai.local @args }
 
 if ((Test-Path $updLock) -and ((Get-Item $updLock).LastWriteTime -gt (Get-Date).AddMinutes(-90))) {
@@ -135,11 +151,15 @@ try {
   $env:CI = 'true'
   # EKS-444: upstream potrafi wydac tag z nieaktualnym pnpm-lock.yaml (2026.1012.0) - wtedy instalacja bez frozen.
   # Repo sluzy tylko do budowy UI i nakladki; serwer i tak pochodzi z npm.
-  try {
-    Run 'pnpm install' { Push-Location $repo; try { & $pnpm[0] $pnpm[1] install --frozen-lockfile --ignore-scripts --config.confirm-modules-purge=false } finally { Pop-Location } }
-  } catch {
-    Add-Content -Path $workLog -Encoding UTF8 -Value '=== pnpm-lock.yaml niezgodny - ponawiam bez --frozen-lockfile'
-    Run 'pnpm install' { Push-Location $repo; try { & $pnpm[0] $pnpm[1] install --no-frozen-lockfile --ignore-scripts --config.confirm-modules-purge=false } finally { Pop-Location } }
+  # EKS-576: kazda proba max 15 min; ponowienie korzysta z paczek juz pobranych do magazynu pnpm.
+  $pnpmArgs = @('install', '--ignore-scripts', '--config.confirm-modules-purge=false', '--reporter=append-only')
+  $lockFlags = @('--frozen-lockfile', '--no-frozen-lockfile', '--no-frozen-lockfile')
+  for ($a = 0; $a -lt $lockFlags.Count; $a++) {
+    try { RunTimed 'pnpm install' 15 $repo (@($pnpm) + $pnpmArgs + $lockFlags[$a]); break }
+    catch {
+      if ($a -eq $lockFlags.Count - 1) { throw }
+      Add-Content -Path $workLog -Encoding UTF8 -Value ("=== " + $_.Exception.Message + " - ponawiam z " + $lockFlags[$a + 1])
+    }
   }
 
   Step 'Testuje nasze zmiany'
