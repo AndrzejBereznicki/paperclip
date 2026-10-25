@@ -100,6 +100,7 @@
     "multer": "^2.4.0",
     "nice-grpc": "2.1.17",
     "nice-grpc-common": "2.0.4",
+    "node-pty": "1.1.0",
     "open": "^11.0.4",
     "opencode-ai": "1.18.34",
     "pino": "^10.0.0",

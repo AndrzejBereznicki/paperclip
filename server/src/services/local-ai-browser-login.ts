@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { open } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
+import type { IPty } from "node-pty";
 import { runSetupTokenLogin } from "@paperclipai/adapter-claude-local/server";
 import { runDeviceLogin } from "@paperclipai/adapter-codex-local/server";
 import { ensureCommandResolvable, resolveCommandForLogs } from "@paperclipai/adapter-utils/server-utils";
@@ -52,6 +53,7 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
   const state: LocalBrowserLoginState = { abort: () => controller.abort() };
   const args = provider === "anthropic" ? ["setup-token"] : ["login", "--device-auth"];
   let child: ChildProcessWithoutNullStreams | null = null;
+  let winPty: IPty | null = null;
   const driver = {
     async start(_command: string, onData: (chunk: string) => void): Promise<{ exitCode: number | null }> {
       let executable = "claude";
@@ -82,6 +84,25 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
         CODEX_HOME: provider === "openai" ? home : process.env.CODEX_HOME,
         BROWSER: "true",
       };
+      if (process.platform === "win32") {
+        // Windows has no `pty` module and no `fork`/`termios`, so the POSIX
+        // bridge below cannot run. node-pty's ConPTY backend gives the login
+        // CLI the real pseudo-terminal it needs (its interactive prompt
+        // never renders over a plain pipe) without requiring Python at all.
+        const { default: pty } = await import("node-pty");
+        const resolvedExecutable = await resolveCommandForLogs(executable, process.cwd(), process.env);
+        return new Promise((resolve, reject) => {
+          try {
+            winPty = pty.spawn(resolvedExecutable, args, { name: "xterm-color", cols: 200, rows: 50, cwd: process.cwd(), env });
+          } catch {
+            state.error = "Browser sign-in could not start the Windows terminal bridge. Restart Paperclip and start sign-in again.";
+            reject(new Error("Browser login terminal unavailable"));
+            return;
+          }
+          winPty.onData((chunk) => onData(chunk));
+          winPty.onExit(({ exitCode }) => resolve({ exitCode: exitCode ?? null }));
+        });
+      }
       return new Promise((resolve, reject) => {
         child = spawn("python3", ["-u", "-c", PYTHON_PTY_BRIDGE, executable, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
         child.stdout.on("data", (bytes: Buffer) => onData(bytes.toString("utf8")));
@@ -94,9 +115,9 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai", home: s
         child.once("close", (exitCode) => resolve({ exitCode }));
       });
     },
-    write(input: string) { child?.stdin.write(input); },
-    stop() { child?.kill("SIGTERM"); },
-    async dispose() { child?.kill("SIGTERM"); },
+    write(input: string) { if (winPty) winPty.write(input); else child?.stdin.write(input); },
+    stop() { winPty?.kill(); child?.kill("SIGTERM"); },
+    async dispose() { winPty?.kill(); child?.kill("SIGTERM"); },
     async readFile(file: string) { const { readLocalAiCredentialFile } = await import("./local-ai-credential-file.js"); return Buffer.from(await readLocalAiCredentialFile(file)); },
   };
   if (provider === "anthropic") {
