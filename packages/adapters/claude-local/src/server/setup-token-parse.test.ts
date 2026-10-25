@@ -418,6 +418,43 @@ describe("parseSetupTokenPrompt", () => {
     expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
   });
 
+  it("reads the real claude 2.1.3xx layout: OSC 8 URL and prompt glued to cursor-position moves with no literal newline", () => {
+    // `claude` 2.1.310 lays out the sign-in screen with absolute Cursor
+    // Position (CSI `H`) moves instead of a literal line feed: the preamble,
+    // the OSC 8 hyperlinked URL, a fixed copy-hint line, and the prompt all
+    // sit on the same raw-text "line" with no `\n` byte anywhere between them
+    // (live capture, 2026-10-25, cols 80/120/200). The CSI `H` move happens to
+    // fall inside the OSC 8 span for the URL itself (consumed whole by {@link
+    // OSC8_HYPERLINK_RE}), but two bare CSI `H` moves sit between the URL and
+    // the prompt, with no other separator.
+    const cursorTo = (row: number, col: number) => `\x1b[${row};${col}H`;
+    const hint = chaSpaced([
+      "Hold",
+      "Shift",
+      "while",
+      "selecting",
+      "to",
+      "use",
+      "your",
+      "terminal's",
+      "native",
+      "copy",
+    ]);
+    const prompt = chaSpaced(["Paste", "code", "here", "if", "prompted", ">"]);
+    const text =
+      "Browser didn't open? Use the url below to sign in (c to copy)" +
+      osc8Hyperlink(CLAUDE_COM_URL, cursorTo(22, 1) + CLAUDE_COM_URL) +
+      cursorTo(25, 2) +
+      hint +
+      "\x1b[m" +
+      cursorTo(28, 2) +
+      prompt;
+    const result = parseSetupTokenPrompt(text);
+    expect(result).not.toBeNull();
+    expect(result?.url).toBe(CLAUDE_COM_URL);
+    expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
   it("binds the prompt after the terminal repeats the URL once per wrapped display row", () => {
     // The terminal can emit one full URL line per wrapped display row, so it
     // repeats the same full authorization URL on a few consecutive lines. The

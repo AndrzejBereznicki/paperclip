@@ -147,6 +147,25 @@ const ANSI_CSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 // eslint-disable-next-line no-control-regex
 const CSI_HORIZONTAL_MOVE_RE = /\x1b\[[0-9;]*[GC]/g;
 
+// A Cursor Position CSI sequence (final byte `H`): absolute row-and-column
+// positioning, with the row and column parameters optional (an empty
+// parameter defaults to row 1, column 1). `claude` 2.1.310 lays out the
+// sign-in screen with this sequence instead of a literal line feed: the URL
+// preamble, the dehyperlinked authorization URL, the "Hold Shift…" copy hint,
+// and the browser-code prompt each start with their own Cursor Position
+// sequence on the same physical terminal row (no `\n` byte anywhere between
+// them). The parser replaces each Cursor Position sequence with one line
+// feed, so a row change reads as a new line the same way the line-based scan
+// below expects. A live capture showed this sequence always introduces a new
+// rendered row for this screen, so turning every occurrence into a line feed
+// never joins two rows that should stay separate; it can only add a harmless
+// blank line, which every line-based scan below already skips. Without this
+// step the later CSI removal deletes the sequence and glues the preamble, the
+// URL, and the prompt into one line with no separator, and the preamble
+// window, the URL-prefix check, and the dedicated prompt line never match.
+// eslint-disable-next-line no-control-regex
+const CSI_CURSOR_POSITION_RE = /\x1b\[[0-9;]*H/g;
+
 // An OSC 8 hyperlink. The terminal emits the URL through an OSC 8 hyperlink plus
 // wrapped display text. The hyperlink carries the true, unwrapped URL in its URI
 // field, while the display text may wrap across lines. The parser replaces the
@@ -172,8 +191,25 @@ const TRAILING_PUNCTUATION_RE = /[)\].,;:!]+$/;
 
 // The line that introduces the URL. The Claude login UI prints this phrase right
 // before the URL. The parser anchors the URL search on this phrase, so a URL far
-// from the login context cannot bind.
-const URL_PREAMBLE_RE = /the url below to sign in/i;
+// from the login context cannot bind. `claude` 2.1.3xx appends the exact
+// literal suffix " (c to copy)" right before the URL, with no separator
+// between the suffix and the URL (the terminal positions the URL with a
+// Cursor Position sequence, which {@link OSC8_HYPERLINK_RE} consumes whole
+// before this regex ever runs). The optional group consumes that exact suffix
+// too, so the preamble match still ends exactly where the URL begins on every
+// CLI version, old or new, and the later URL-prefix check still finds the URL
+// at the very start of its line.
+const URL_PREAMBLE_RE = /the url below to sign in(?: \(c to copy\))?/i;
+
+// The copy-hint line. `claude` 2.1.3xx prints this exact line on its own
+// terminal row right after the authorization URL and right before the
+// browser-code prompt, when the terminal advertises OSC 8 hyperlink support
+// (the same build that prints "(c to copy)" in the preamble). The parser
+// skips exactly this one fixed phrase between the URL and the prompt, the
+// same way it skips a repeated URL line. This is a fixed-phrase skip, not a
+// wildcard: any other line still falls through to the prompt check below and
+// fails closed when that line is also not the prompt.
+const COPY_HINT_LINE_RE = /^Hold Shift while selecting to use your terminal's native copy$/;
 
 // The browser-code prompt on a dedicated line. The line starts with the exact
 // prompt phrase. The line can end with the input caret `>` and masked echo `*`
@@ -205,7 +241,9 @@ interface SetupTokenUrlMatch {
  * hyperlink with its true URI, so the parser reads the unwrapped URL and drops
  * the wrapped display text. Removes each leftover OSC sequence. Replaces each
  * horizontal-move CSI sequence with one space, so a word that the login UI lays
- * out at an absolute column reads as a space-separated word. Removes each
+ * out at an absolute column reads as a space-separated word. Replaces each
+ * Cursor Position CSI sequence with one line feed, so a row change reads as a
+ * new line even when the terminal emits no literal `\n` byte. Removes each
  * remaining ANSI CSI sequence. Returns plain text. The function only normalizes
  * the input; the URL and the prompt still pass the shape validation below.
  */
@@ -214,6 +252,7 @@ function stripTerminalControls(text: string): string {
     .replace(OSC8_HYPERLINK_RE, "$1")
     .replace(OSC_ANY_RE, "")
     .replace(CSI_HORIZONTAL_MOVE_RE, " ")
+    .replace(CSI_CURSOR_POSITION_RE, "\n")
     .replace(ANSI_CSI_RE, "");
 }
 
@@ -362,10 +401,12 @@ function reassembleUrl(lines: string[], startLine: number): SetupTokenUrlMatch |
  * Returns the canonical browser-code prompt when `lines` holds it on a dedicated
  * line after the URL block. The parser reads the non-blank lines after the URL
  * end line. The Claude UI can emit one full URL line per wrapped display row, so
- * it repeats the same full authorization URL on a few consecutive lines. The
- * parser skips a line that repeats `url`, then binds the prompt on the first
- * non-blank, non-repeat line. That line must match the exact prompt shape.
- * Returns null when the first non-blank, non-repeat line is not the prompt.
+ * it repeats the same full authorization URL on a few consecutive lines. A
+ * newer CLI build also emits one fixed copy-hint line between the URL and the
+ * prompt. The parser skips a line that repeats `url`, and skips the one fixed
+ * copy-hint line, then binds the prompt on the first remaining non-blank line.
+ * That line must match the exact prompt shape. Returns null when the first
+ * remaining non-blank line is not the prompt.
  */
 function findBrowserCodePrompt(lines: string[], endLine: number, url: string): string | null {
   for (let i = endLine + 1; i < lines.length; i += 1) {
@@ -375,6 +416,9 @@ function findBrowserCodePrompt(lines: string[], endLine: number, url: string): s
     // punctuation first, the same way the repeated-URL comparison needs, so a
     // repeated URL with a trailing punctuation mark still matches.
     if (trimmed.replace(TRAILING_PUNCTUATION_RE, "") === url) continue;
+    // Skip the one fixed copy-hint line a newer CLI build prints between the
+    // URL and the prompt.
+    if (COPY_HINT_LINE_RE.test(trimmed)) continue;
     return PROMPT_LINE_RE.test(trimmed) ? SETUP_TOKEN_PROMPT : null;
   }
   return null;
