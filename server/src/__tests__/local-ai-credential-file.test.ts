@@ -6,7 +6,23 @@ import { readLocalAiCredentialFile } from "../services/local-ai-credential-file.
 let home: string;
 beforeEach(async () => { home = await realpath(await mkdtemp(path.join(os.tmpdir(), "ai-auth-read-"))); });
 afterEach(async () => { await rm(home, { recursive: true, force: true }); });
-describe("isolated credential file safety", () => {
+describe.runIf(process.platform === "win32")("isolated credential file safety on Windows", () => {
+  it("reads a bounded regular file and rejects oversized files, directories, and relative paths", async () => {
+    const filename = path.join(home, "credentials.json");
+    await writeFile(filename, "fixture");
+    await expect(readLocalAiCredentialFile(filename)).resolves.toBe("fixture");
+    await expect(readLocalAiCredentialFile("credentials.json")).rejects.toThrow();
+    await expect(readLocalAiCredentialFile(home)).rejects.toThrow();
+    await writeFile(filename, Buffer.alloc(64 * 1024 + 1));
+    await expect(readLocalAiCredentialFile(filename)).rejects.toThrow();
+  });
+  it("rejects a file reached through a directory junction", async () => {
+    await writeFile(path.join(home, "credentials.json"), "fixture");
+    await symlink(home, path.join(home, "linked-home"), "junction");
+    await expect(readLocalAiCredentialFile(path.join(home, "linked-home", "credentials.json"))).rejects.toThrow();
+  });
+});
+describe.skipIf(process.platform === "win32")("isolated credential file safety", () => {
   it("reads only bounded private regular files", async () => {
     const filename = path.join(home, "credentials.json");
     await writeFile(filename, "fixture", { mode: 0o600 });
