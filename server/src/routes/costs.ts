@@ -32,7 +32,7 @@ import {
   accessService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
-import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
+import { fetchCompanyQuotaWindows, fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest, forbidden } from "../errors.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -340,7 +340,11 @@ export function costRoutes(
       return;
     }
     const results = await fetchCompanyQuotaWindows(db, companyId, getActorInfo(req).actorId);
-    res.json(results);
+    // EKS-589: companies without a managed AI connection (e.g. agents using the
+    // default ~/.claude login) get no managed-connection data here; fall back to
+    // the local-login probe so the usage widget still has something to show.
+    const hasManagedData = results.some((result) => result.ok && result.windows.length > 0);
+    res.json(hasManagedData ? results : await fetchAllQuotaWindows());
   });
 
   router.get("/companies/:companyId/budgets/overview", async (req, res) => {
