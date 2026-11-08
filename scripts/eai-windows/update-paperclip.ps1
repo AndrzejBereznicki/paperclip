@@ -200,7 +200,7 @@ try {
     Where-Object { Test-Path (Join-Path $repo $_) })
   $overlay = Join-Path $env:TEMP "pc-overlay-$stamp"
   if ($serverSrc.Count -gt 0) {
-    $full = $serverSrc | ForEach-Object { Join-Path $repo $_ }
+    $full = @($serverSrc | ForEach-Object { Join-Path $repo $_ })
     Run 'esbuild serwera' { & (Join-Path $repo 'node_modules\.bin\esbuild.cmd') @full "--outdir=$overlay" "--outbase=$(Join-Path $repo 'server\src')" --format=esm --platform=node --target=node22 --log-level=warning }
   }
   # ZHC-762: to samo dla adapterow - dist/ adaptera w npm odpowiada src/ w repo
@@ -211,7 +211,7 @@ try {
     if ($adSrc.Count -eq 0) { continue }
     $adName = ([System.IO.File]::ReadAllText((Join-Path $repo "$ad/package.json")) | ConvertFrom-Json).name
     $adOut = Join-Path $env:TEMP ("pc-overlay-$stamp-" + ($ad -split '/')[2])
-    $adFull = $adSrc | ForEach-Object { Join-Path $repo $_ }
+    $adFull = @($adSrc | ForEach-Object { Join-Path $repo $_ })
     Run "esbuild $adName" { & (Join-Path $repo 'node_modules\.bin\esbuild.cmd') @adFull "--outdir=$adOut" "--outbase=$(Join-Path $repo "$ad/src")" --format=esm --platform=node --target=node22 --log-level=warning }
     $adapterOverlays += @{ name = $adName; dir = $adOut; files = @($adSrc | ForEach-Object { 'dist/' + ($_.Substring($ad.Length + 5) -replace '\.ts$', '.js') }) }
   }
