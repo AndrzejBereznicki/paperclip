@@ -109,7 +109,11 @@ try {
   $ours = @(RepoGit rev-list --reverse "$($fromMeta.baseTag)..$($fromMeta.branch)")
   if ($ours.Count -eq 0) { throw "brak naszych commitow w $($fromMeta.branch)" }
   $touched = @(RepoGit diff --name-only "$($fromMeta.baseTag)..$($fromMeta.branch)")
-  $outside = @($touched | Where-Object { $_ -notmatch '^(server/src|ui/src|scripts/eai-windows)/' })
+  # ZHC-762: adaptery (packages/adapters/<x>/src) ida nakladka jak serwer; nowe zaleznosci serwera
+  # (server/package.json + pnpm-lock.yaml) dochodza do package.json nowego pkg.
+  $outside = @($touched | Where-Object {
+      $_ -notmatch '^(server/src|ui/src|scripts/eai-windows|packages/adapters/[^/]+/src)/' -and
+      $_ -notin @('pnpm-lock.yaml', 'server/package.json') })
   if ($outside.Count -gt 0) { throw ("nasze zmiany dotykaja plikow poza server/ui - automat ich nie przeniesie: " + ($outside -join ', ')) }
 
   Step ("Przenosze nasze zmiany (" + $ours.Count + " commitow)")
@@ -145,6 +149,15 @@ try {
     }
   }
 
+  # ZHC-762: zaleznosci, ktore nasze zmiany dodaly do server/package.json (np. node-pty, EKS-585)
+  $upDeps = ((RepoGit show "${newTag}:server/package.json") -join "`n" | ConvertFrom-Json).dependencies
+  $ourDeps = ([System.IO.File]::ReadAllText((Join-Path $repo 'server\package.json')) | ConvertFrom-Json).dependencies
+  $extraServerDeps = [ordered]@{}
+  foreach ($p in $ourDeps.PSObject.Properties) { if (-not $upDeps.PSObject.Properties[$p.Name]) { $extraServerDeps[$p.Name] = $p.Value } }
+
+  # ZHC-762: katalogi adapterow, ktorych zrodla zmienilismy (packages/adapters/<x>)
+  $adapterDirs = @($touched | Where-Object { $_ -match '^packages/adapters/[^/]+/src/' } | ForEach-Object { ($_ -split '/')[0..2] -join '/' } | Select-Object -Unique)
+
   Step 'Instaluje zaleznosci'
   # corepack wybiera wersje pnpm z packageManager w BIEZACYM katalogu - dlatego Push-Location, nie -C
   # EKS-327: bez okna pnpm nie moze pytac "usunac node_modules? (Y/n)" - inaczej wisi w nieskonczonosc
@@ -163,8 +176,14 @@ try {
   }
 
   Step 'Testuje nasze zmiany'
+  # ZHC-762: od 1106.0 serwer importuje @paperclipai/plugin-sdk (eksportuje tylko dist/) - bez builda
+  # testy serwera nie startuja. Skrypt "build" pakietu uzywa mkdir -p (nie dziala w cmd.exe), wiec samo tsc.
+  foreach ($d in 'packages\shared', 'packages\plugins\sdk') {
+    if (!(Test-Path (Join-Path $repo "$d\tsconfig.json"))) { continue }
+    Run "tsc $d" { Push-Location (Join-Path $repo $d); try { & (Join-Path $repo 'node_modules\.bin\tsc.cmd') } finally { Pop-Location } }
+  }
   $tests = @($touched | Where-Object { $_ -match '\.test\.tsx?$' })
-  foreach ($pkgDir in @('server', 'ui')) {
+  foreach ($pkgDir in @('server', 'ui') + $adapterDirs) {
     $files = @($tests | Where-Object { $_ -like "$pkgDir/*" } | ForEach-Object { $_.Substring($pkgDir.Length + 1) })
     if ($files.Count -eq 0) { continue }
     Run "testy $pkgDir nie przechodza" { Push-Location (Join-Path $repo $pkgDir); try { & (Join-Path $repo 'node_modules\.bin\vitest.cmd') run @files } finally { Pop-Location } }
@@ -184,6 +203,18 @@ try {
     $full = $serverSrc | ForEach-Object { Join-Path $repo $_ }
     Run 'esbuild serwera' { & (Join-Path $repo 'node_modules\.bin\esbuild.cmd') @full "--outdir=$overlay" "--outbase=$(Join-Path $repo 'server\src')" --format=esm --platform=node --target=node22 --log-level=warning }
   }
+  # ZHC-762: to samo dla adapterow - dist/ adaptera w npm odpowiada src/ w repo
+  $adapterOverlays = @()
+  foreach ($ad in $adapterDirs) {
+    $adSrc = @($touched | Where-Object { $_ -like "$ad/src/*" -and $_ -match '\.ts$' -and $_ -notmatch '(\.test\.ts|/__tests__/)' } |
+      Where-Object { Test-Path (Join-Path $repo $_) })
+    if ($adSrc.Count -eq 0) { continue }
+    $adName = ([System.IO.File]::ReadAllText((Join-Path $repo "$ad/package.json")) | ConvertFrom-Json).name
+    $adOut = Join-Path $env:TEMP ("pc-overlay-$stamp-" + ($ad -split '/')[2])
+    $adFull = $adSrc | ForEach-Object { Join-Path $repo $_ }
+    Run "esbuild $adName" { & (Join-Path $repo 'node_modules\.bin\esbuild.cmd') @adFull "--outdir=$adOut" "--outbase=$(Join-Path $repo "$ad/src")" --format=esm --platform=node --target=node22 --log-level=warning }
+    $adapterOverlays += @{ name = $adName; dir = $adOut; files = @($adSrc | ForEach-Object { 'dist/' + ($_.Substring($ad.Length + 5) -replace '\.ts$', '.js') }) }
+  }
 
   Step ("Instaluje paperclipai " + $installVersion + " (npm)")
   $pkgPath = Join-Path $Root $newPkg
@@ -191,6 +222,7 @@ try {
   New-Item -ItemType Directory -Path $pkgPath | Out-Null
   $deps = [ordered]@{ paperclipai = $installVersion }
   foreach ($p in $Cfg.extraDependencies.PSObject.Properties) { $deps[$p.Name] = $p.Value }
+  foreach ($k in $extraServerDeps.Keys) { $deps[$k] = $extraServerDeps[$k] }
   $pj = [ordered]@{ name = 'paperclip-pinned'; version = '1.0.0'; private = $true; dependencies = $deps } | ConvertTo-Json
   [System.IO.File]::WriteAllText((Join-Path $pkgPath 'package.json'), $pj, (New-Object System.Text.UTF8Encoding($false)))
   Run 'npm install' { Push-Location $pkgPath; try { & (Join-Path $Cfg.nodeDir 'npm.cmd') install --no-audit --no-fund } finally { Pop-Location } }
@@ -200,6 +232,11 @@ try {
   if (!(Test-Path (Join-Path $serverPkg 'dist\app.js'))) { throw 'npm nie zainstalowal @paperclipai/server' }
   if (Test-Path $overlay) {
     Copy-Item -Recurse -Force (Join-Path $overlay '*') (Join-Path $serverPkg 'dist')
+  }
+  foreach ($o in $adapterOverlays) {
+    $adPkg = Join-Path $pkgPath ('node_modules\' + ($o.name -replace '/', '\'))
+    if (!(Test-Path (Join-Path $adPkg 'dist'))) { throw "npm nie zainstalowal $($o.name)" }
+    Copy-Item -Recurse -Force (Join-Path $o.dir '*') (Join-Path $adPkg 'dist')
   }
   Rename-Item (Join-Path $serverPkg 'ui-dist') 'ui-dist.upstream'
   Copy-Item -Recurse (Join-Path $repo 'ui\dist') (Join-Path $serverPkg 'ui-dist')
@@ -213,11 +250,46 @@ try {
   Run 'latka windowsHide' { & $NodeExe (Join-Path $Root 'patch-windows-hide.mjs') $entry }
   Run 'index.js po latce windowsHide nie parsuje sie' { & $NodeExe --check $entry }
 
+  # EKS-606: skills/paperclip/scripts/{paperclip-issue-update,paperclip-upload-artifact}.sh wysylaja
+  # payload do curla jako argument (--data-binary "$payload") - na Windows to psuje polskie znaki.
+  $adaptersRoot = Split-Path $serverPkg
+  $curlPatchTargets = @(
+    Join-Path $adaptersRoot 'adapter-claude-local\skills\paperclip\scripts\paperclip-issue-update.sh'
+    Join-Path $adaptersRoot 'adapter-codex-local\skills\paperclip\scripts\paperclip-issue-update.sh'
+    Join-Path $serverPkg 'skills\paperclip\scripts\paperclip-issue-update.sh'
+    Join-Path $adaptersRoot 'adapter-claude-local\skills\paperclip\scripts\paperclip-upload-artifact.sh'
+    Join-Path $adaptersRoot 'adapter-codex-local\skills\paperclip\scripts\paperclip-upload-artifact.sh'
+    Join-Path $serverPkg 'skills\paperclip\scripts\paperclip-upload-artifact.sh'
+  ) | Where-Object { Test-Path $_ }
+  if ($curlPatchTargets.Count -gt 0) {
+    Run 'latka curl --data-binary @file (polskie znaki)' { & $NodeExe (Join-Path $Root 'patch-curl-data-file.mjs') @curlPatchTargets }
+  }
+
+  # EKS-600: @paperclipai/adapter-utils writePaperclipClaudeSettings() wpisuje na stale
+  # Bash(curl:*)/Bash(env)/Bash(env:*) do .claude/settings.local.json kazdego workspace'u agenta.
+  # Nakladamy latke na kopie w nowym pkg oraz na osobna, wspolna instalacje adapter-plugins, z ktorej
+  # silnik ACP faktycznie odpala sesje agentow (nie jest czesc tego npm install, ale przeleci tu
+  # nieszkodliwie idempotentnie - taniej niz pamietac o osobnym kroku).
+  $adapterUtilsTargets = @(
+    (Join-Path $adaptersRoot 'adapter-utils\dist\acpx-engine\execute.js')
+    'C:\Users\xfire\.paperclip\adapter-plugins\node_modules\@paperclipai\adapter-utils\dist\acpx-engine\execute.js'
+  ) | Where-Object { Test-Path $_ }
+  if ($adapterUtilsTargets.Count -gt 0) {
+    Run 'latka no-wide-bash-allow (Bash curl/env)' { & $NodeExe (Join-Path $Root 'patch-no-wide-bash-allow.mjs') @adapterUtilsTargets }
+  }
+
   Step 'Sprawdzam, czy nowa wersja sie laduje'
   $imports = @('dist/app.js') + ($serverSrc | ForEach-Object { 'dist/' + ($_ -replace '^server/src/', '' -replace '\.ts$', '.js') })
-  $js = ($imports | Select-Object -Unique | ForEach-Object {
-      "await import('file:///" + ((Join-Path $serverPkg $_) -replace '\\', '/') + "');"
+  $importPaths = @($imports | ForEach-Object { Join-Path $serverPkg $_ })
+  foreach ($o in $adapterOverlays) {
+    foreach ($f in $o.files) { $importPaths += Join-Path $pkgPath ('node_modules\' + ($o.name -replace '/', '\') + '\' + $f) }
+  }
+  foreach ($k in $extraServerDeps.Keys) { $importPaths += Join-Path $pkgPath "node_modules\$k" }
+  $js = ($importPaths | Select-Object -Unique | ForEach-Object {
+      if ($_ -match '\.js$') { "await import('file:///" + ($_ -replace '\\', '/') + "');" }
+      else { "createRequire(import.meta.url)('" + ($_ -replace '\\', '/') + "');" }
     }) -join ' '
+  $js = "import { createRequire } from 'node:module'; " + $js
   Run 'nowa wersja serwera nie laduje sie' { & $NodeExe --input-type=module -e "$js console.log('import ok'); process.exit(0);" }
   if (!(Test-Path (Join-Path $serverPkg 'ui-dist\index.html'))) { throw 'brak ui-dist\index.html' }
 
