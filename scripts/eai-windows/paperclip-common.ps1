@@ -90,6 +90,20 @@ function Stop-PaperclipServer([string]$pkg) {
   return -not (Get-PostgresProcesses)
 }
 
+# ZHC-785: po udanej podmianie zostaje aktywny pkg + 1 poprzedni oraz najnowsza kopia bazy z aktualizacji.
+# Wszystko inne pkg-* (stare wersje, *.old-*, *-test-*) i db.bak-update-* jest usuwane. -WhatIf = tylko lista.
+function Invoke-UpdateRetention([string[]]$KeepPkgs, [switch]$WhatIf) {
+  $keep = @($KeepPkgs | Where-Object { $_ }) + @(Get-ActivePkg)
+  $pkgs = @(Get-ChildItem $Root -Directory -Filter 'pkg-*' | Where-Object { $keep -notcontains $_.Name })
+  $baks = @(Get-ChildItem (Split-Path $Cfg.dbDir) -Directory -Filter ((Split-Path $Cfg.dbDir -Leaf) + '.bak-update-*') |
+    Sort-Object Name -Descending | Select-Object -Skip 1)
+  foreach ($d in $pkgs + $baks) {
+    if ($WhatIf) { Write-Output ("usunalbym: " + $d.FullName); continue }
+    Remove-Item -Recurse -Force $d.FullName -ErrorAction SilentlyContinue
+    Log ("retencja: " + $(if (Test-Path $d.FullName) { 'NIE usunieto ' } else { 'usunieto ' }) + $d.FullName)
+  }
+}
+
 function Start-Watchdog {
   if ($Cfg.scheduledTask) {
     schtasks.exe /Run /TN $Cfg.scheduledTask | Out-Null

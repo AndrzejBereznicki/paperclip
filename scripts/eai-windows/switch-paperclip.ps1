@@ -38,9 +38,6 @@ try {
   robocopy $Cfg.dbDir $dbBak /E /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null
   $rc = $LASTEXITCODE; $ErrorActionPreference = $eap
   if ($rc -ge 8) { throw "kopia bazy nie powiodla sie (robocopy $rc)" }
-  # zostaw dwie ostatnie kopie z aktualizacji
-  Get-ChildItem (Split-Path $Cfg.dbDir) -Directory -Filter ((Split-Path $Cfg.dbDir -Leaf) + '.bak-update-*') |
-    Sort-Object Name -Descending | Select-Object -Skip 2 | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
   Set-ActivePkg $newPkg
 }
@@ -58,6 +55,8 @@ Start-Watchdog
 if (Wait-ServerUp $newPkg $timeout) {
   $state.state = 'updated'; $state.step = 'Gotowe'; Write-UpdateState $state
   Log ("switch: OK - dziala " + $newPkg)
+  # ZHC-785: sprzatanie dopiero po udanym starcie - przy wycofaniu potrzebne sa $oldPkg i $dbBak
+  try { Invoke-UpdateRetention @($newPkg, $oldPkg) } catch { Log ("retencja: blad " + $_.Exception.Message) }
   exit 0
 }
 
